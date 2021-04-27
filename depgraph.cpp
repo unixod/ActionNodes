@@ -16,7 +16,6 @@
 #include "parser.h"
 
 
-
 class ThreadPool {
 public:
     ThreadPool(std::size_t numOfThreads = std::thread::hardware_concurrency())
@@ -43,96 +42,119 @@ public:
         stop_ = true;
         lck.unlock();
 
-        cv_.notify_all();
+        cvThs_.notify_all();
 
         for (auto& th : threads_) {
             th.join();
         }
     }
 
-    template<typename Callable>
-    void runAsync(Callable&& func)
+    template<typename Callable, typename Cnt>
+    void apply(Callable&& func, const Cnt cnt)
     {
+        assert(cnt >= 0);
+        assert(cnt <= std::numeric_limits<decltype(cnt_)::value_type>::max());
+        cnt_ = cnt;
+        func_ = std::ref(func);
+
+        apply_();
+
         std::unique_lock lck{mx_};
-        queue_.emplace_back(std::forward<Callable>(func));
-
-        if (mainThreadWaiting) {
-            lck.unlock();
-            cvMain_.notify_one();
-            return;
-        }
-        else {
-            lck.unlock();
-            cv_.notify_one();
-        }
-    }
-
-    void wait()
-    {
-        while (true) {
-            std::unique_lock lck{mx_};
-
-            // suspend if queue.empty && busyWorkerThreads != 0
-            cvMain_.wait(lck, [this](){
-                return !queue_.empty() || busyWorkerThreads_ == 0;
-            });
-
-            if (busyWorkerThreads_ == 0) {
-                assert(queue_.empty());
-                return;
-            }
-
-            auto f = std::move(queue_.front());
-            queue_.pop_front();
-            lck.unlock();
-            f();
-        }
+        cvMain_.wait(lck, [this]{
+            return busyWorkerThreads_ == 0;
+        });
     }
 
 private:
     void run_()
     {
-        while(true) {
+        while(!stop_) {
             std::unique_lock lck{mx_};
-
-            cv_.wait(lck, [this]{
-                if (--busyWorkerThreads_ == 0 && queue_.empty()) {
-                    cvMain_.notify_one();
-                }
-
-                return !queue_.empty() || stop_;
+            assert(busyWorkerThreads_ > 0);
+            if (--busyWorkerThreads_ == 0) {
+                cvMain_.notify_one();
+            }
+            cvThs_.wait(lck, [this]{
+                return cnt_ > 0 || stop_;
             });
-
             if (stop_) {
                 return;
             }
-
             ++busyWorkerThreads_;
-
-            auto f = std::move(queue_.front());
-            queue_.pop_front();
             lck.unlock();
 
-            f();
+            apply_();
+        }
+    }
+
+    void apply_()
+    {
+        auto c = --cnt_;
+
+        if (c > 0) {
+            cvThs_.notify_one();
+        }
+
+        for (; c >= 0; c = --cnt_) {
+            func_(c);
         }
     }
 
 private:
-    std::mutex mx_;
-    std::condition_variable cv_;
-    std::condition_variable cvMain_;
-    std::deque<std::function<void()>> queue_;
-    std::vector<std::thread> threads_;
-
     bool stop_ = false;
-    bool mainThreadWaiting = true;
     std::size_t busyWorkerThreads_;
+    std::mutex mx_;
+    std::vector<std::thread> threads_;
+    std::atomic<std::ptrdiff_t> cnt_ = 0;
+    std::condition_variable cvThs_;
+    std::condition_variable cvMain_;
+    std::function<void(std::ptrdiff_t)> func_;
+};
+
+struct NonAtomicallyMovableAtomicFlag  {
+    NonAtomicallyMovableAtomicFlag() = default;
+
+    NonAtomicallyMovableAtomicFlag(NonAtomicallyMovableAtomicFlag&& oth) noexcept
+    {
+        if (oth.flag.test_and_set()) {
+            flag.test_and_set();
+        }
+    }
+
+    NonAtomicallyMovableAtomicFlag& operator = (NonAtomicallyMovableAtomicFlag&& oth) noexcept
+    {
+        if (oth.flag.test_and_set()) {
+            flag.test_and_set();
+        }
+        else {
+            flag.clear();
+        }
+        return *this;
+    }
+
+    NonAtomicallyMovableAtomicFlag(const NonAtomicallyMovableAtomicFlag& oth) = delete;
+    NonAtomicallyMovableAtomicFlag& operator = (const NonAtomicallyMovableAtomicFlag&) = delete;
+    ~NonAtomicallyMovableAtomicFlag() = default;
+
+    bool testAndSet() noexcept
+    {
+        return flag.test_and_set();
+    }
+
+    void clear() noexcept
+    {
+        return flag.clear();
+    }
+
+private:
+    std::atomic_flag flag = ATOMIC_FLAG_INIT;
 };
 
 class CalcGraph {
 public:
     class Node;
-    enum class NodeRank {};
+    enum class NodeRank {Nil = -1};
+
     enum class NodeId : std::size_t {};
 
     class Expression;
@@ -146,7 +168,7 @@ public:
 
 public:
     template<typename ValueType>
-    NodeId addNode(ValueType&& expr)
+    NodeId addNode(ValueType&& expr, ThreadPool& pool)
     {
         using DecayedValueType = std::decay_t<ValueType>;
         constexpr bool vtIsExprOrValue = IsExpression<DecayedValueType>::value || IsValue<DecayedValueType>::value;
@@ -155,12 +177,13 @@ public:
         auto nodeId = NodeId{nodes_.size()};
 //        nodes_.emplace_back(*this, nodeId, std::move(expr));
         nodes_.emplace_back(*this, nodeId, Value{});
-        resetValueAt(nodeId, std::forward<ValueType>(expr));
+
+        resetValueAt(nodeId, std::forward<ValueType>(expr), pool);
         return nodeId;
     }
 
     template<typename ValueType>
-    void resetValueAt(NodeId nodeId, ValueType&& value/*, ThreadPool&*/);
+    void resetValueAt(NodeId nodeId, ValueType&& value, ThreadPool&);
 
     Value getValueAt(NodeId) const;
 
@@ -168,8 +191,9 @@ private:
     calc::utils::RIVector<Node, NodeId> nodes_;
     calc::utils::SparseSet<NodeId> stopNodes_;       // Used in resetValueAt for handle possible cycles.
 
+
     struct LayerInfo {
-        LayerInfo(std::int64_t layerBuffOffset)
+        LayerInfo(std::ptrdiff_t layerBuffOffset)
             : baseBuffOffset{layerBuffOffset}
         {}
 
@@ -199,16 +223,14 @@ private:
             return *this;
         }
 
-        std::int64_t baseBuffOffset;
-        std::atomic<std::int64_t> capacityDeltaUpdate = 0;
-        std::atomic<std::int64_t> schedSize = 0;
+        std::ptrdiff_t baseBuffOffset;
+        std::atomic<std::ptrdiff_t> capacityDeltaUpdate = 0;
+        std::atomic<std::ptrdiff_t> schedSize = 0;
     };
 
     struct Layers {
         std::vector<NodeId> buff;
-        calc::utils::RIVector<LayerInfo, NodeRank> info{LayerInfo{0}};
-
-        std::size_t numOfNewLayers = 0;
+        calc::utils::RIVector<LayerInfo, NodeRank> info;
     };
 
     Layers layers_;
@@ -262,7 +284,7 @@ private:
 class CalcGraph::Node {
 public:
     Node(const CalcGraph&, NodeId /*thisNodeId*/, Value v) noexcept
-        : rank_{0}, value_{v}
+        : value_{v}
     {}
 
     template<
@@ -354,17 +376,19 @@ private:
 
 private:
     Expression expr_;
-    NodeRank rank_;
+    NodeRank rank_ = NodeRank::Nil;
     Value value_;
 
     /// A set of nodes dependent on the value/rank of this node.
     std::vector<NodeId> subscribedToUpdate_;
+
+
+public:
+    NonAtomicallyMovableAtomicFlag isScheduledForIncrementalUpdate;
 };
 
-
-
 template<typename ValueType>
-void CalcGraph::resetValueAt(NodeId nodeId, ValueType&& expr/*, ThreadPool& pool*/)
+void CalcGraph::resetValueAt(NodeId nodeId, ValueType&& expr, ThreadPool& pool)
 {
     using DecayedValueType = std::decay_t<ValueType>;
     constexpr bool vtIsExprOrValue = IsExpression<DecayedValueType>::value || IsValue<DecayedValueType>::value;
@@ -372,12 +396,9 @@ void CalcGraph::resetValueAt(NodeId nodeId, ValueType&& expr/*, ThreadPool& pool
 
     assert(nodeId < nodes_.rsize());
 
-    // TODO: Think about possible optimization: buff.resize(nodes_.size() - num of nodes in node_[nodeId].rank());
-    layers_.buff.resize(nodes_.size());
-
     // Add predecessors to layer.
     auto schedulePredsForProcessing = [this](NodeId id) {
-        NodeRank maxRank{};
+        NodeRank maxRank = NodeRank::Nil;
 
         // Populate layers (schedule processing of predecessors).
         for (auto predNodeId : nodes_[id].subscribedNodeIds()) {
@@ -389,11 +410,16 @@ void CalcGraph::resetValueAt(NodeId nodeId, ValueType&& expr/*, ThreadPool& pool
             assert(predNodeId < nodes_.rsize());
 
             auto predNodeRank = nodes_[predNodeId].rank();
+            assert(predNodeRank != NodeRank::Nil);
+
+            if (auto& predNode = nodes_[predNodeId]; predNode.isScheduledForIncrementalUpdate.testAndSet()) {
+                continue;
+            }
 
             auto offset = layers_.info[predNodeRank].schedSize++;
             auto layerBaseBuffOffset = layers_.info[predNodeRank].baseBuffOffset;
+            assert(calc::utils::makeUnsigned(layerBaseBuffOffset + offset) < layers_.buff.size());
             layers_.buff[calc::utils::makeUnsigned(layerBaseBuffOffset + offset)] = predNodeId;
-
             if (maxRank < predNodeRank) {
                 maxRank = predNodeRank;
             }
@@ -407,6 +433,7 @@ void CalcGraph::resetValueAt(NodeId nodeId, ValueType&& expr/*, ThreadPool& pool
 
         auto originalRank = node.rank();
 
+        node.isScheduledForIncrementalUpdate.clear();
         node.fetchValueAndRank(*graph);
 
         if (auto newRank = node.rank(); newRank != originalRank) {
@@ -427,61 +454,99 @@ void CalcGraph::resetValueAt(NodeId nodeId, ValueType&& expr/*, ThreadPool& pool
     }
 
     auto& node = nodes_[nodeId];
-    auto originalRank = node.rank();
+    const auto originalRank = node.rank();
 
     node.reset(*this, nodeId, std::forward<ValueType>(expr));
 
-    if (auto newRank = node.rank(); newRank > originalRank) {
-        // Add more layer descriptors if node is moved beyoud the current set of layers.
-        if (newRank >= layers_.info.rsize()) {
-            assert(layers_.info.size() <= nodes_.size());
-            const auto rankDiff = calc::utils::makeUnsigned(newRank - originalRank);
-            const auto layersCntToAdd = std::min<std::size_t>(rankDiff,  nodes_.size() - layers_.info.size());
+    const auto newRank = node.rank();
 
-            if (layersCntToAdd > 0) {
-                layers_.info.resize(layers_.info.size() + layersCntToAdd, 0);
-                layers_.numOfNewLayers = layersCntToAdd;
-            }
+    // For each node with rank > 0 reserve one element in buf.
+    const auto schedulePopBuf = newRank < originalRank;
+
+    if (newRank > originalRank) {
+        // For each node with rank > 0 reserve one element in buf.
+        if (originalRank == NodeRank::Nil) {
+            layers_.buff.push_back({});
+        }
+
+        // Add more layer descriptors if node is moved beyoud the current set of layers.
+        assert(layers_.info.size() <= nodes_.size());
+        const auto rankDiff = calc::utils::makeUnsigned(newRank - originalRank);
+        const auto layersCntToAdd = std::min<std::size_t>(rankDiff,  nodes_.size() - layers_.info.size());
+
+        if (layersCntToAdd > 0) {
+            layers_.info.resize(layers_.info.size() + layersCntToAdd, 0);
         }
 
         assert(newRank <= layers_.info.rsize());
-        layers_.info[originalRank].capacityDeltaUpdate--;
         layers_.info[newRank].capacityDeltaUpdate++;
+
+        // Nil rank elements don't have dedicated element in layers_ structure.
+        if (originalRank != NodeRank::Nil) {
+            layers_.info[originalRank].capacityDeltaUpdate--;
+        }
     }
     else if (newRank < originalRank){
-        for (auto i = calc::utils::toUnderlying(newRank) + 1; i <= calc::utils::toUnderlying(originalRank); ++i) {
-            layers_.info[NodeRank{i}].baseBuffOffset += 1;
+        layers_.info[originalRank].capacityDeltaUpdate--;
+
+        // Nil rank elements don't have dedicated element in layers_ structure.
+        if (newRank != NodeRank::Nil) {
+            layers_.info[newRank].capacityDeltaUpdate++;
         }
     }
 
     // A point where to stop further processing (during processing of further layers this boundary may be changed
     // in a higher value).
-    auto maxTouchedRank = schedulePredsForProcessing(nodeId);
+    /*auto maxTouchedRank = */schedulePredsForProcessing(nodeId);
 
-    auto layerBuffBaseDelta = layers_.info[originalRank].capacityDeltaUpdate.load();
-    layers_.info[originalRank].capacityDeltaUpdate = 0;
+//    auto layerBuffBaseDelta = layers_.info[originalRank].capacityDeltaUpdate.load();
+//    layers_.info[originalRank].capacityDeltaUpdate = 0;
 
-    // Update value and ranks of predecessors.
-    for (auto i = calc::utils::toUnderlying(originalRank) + 1; i <= calc::utils::toUnderlying(maxTouchedRank); ++i) {
-        auto currRank = NodeRank{i};
-        assert(currRank < layers_.info.rsize());
+    auto layerBuffBaseDelta = std::ptrdiff_t{0};
+    for (auto& layer : layers_.info) {
+        assert(layer.baseBuffOffset >= 0);
 
-        assert(layers_.info[currRank].baseBuffOffset >= 0);
-
-        auto wrBegin = layers_.buff.begin() + layers_.info[currRank].baseBuffOffset;
-        auto wrEnd = wrBegin + layers_.info[currRank].schedSize;
-        auto max = [](auto a, auto b) { return std::max(a, b); };
-        maxTouchedRank = std::transform_reduce(/*std::execution::par, */wrBegin, wrEnd, maxTouchedRank, max, update);
+        auto wrBegin = layers_.buff.begin() + layer.baseBuffOffset;
+//        auto wrEnd = wrBegin + layer.schedSize;
+//        auto max = [](auto a, auto b) { return std::max(a, b); };
+//        std::transform_reduce(/*std::execution::par, */wrBegin, wrEnd, maxTouchedRank, max, update);
+        pool.apply([&update, &wrBegin](auto i){
+            update(*std::next(wrBegin, i));
+        }, layer.schedSize.load());
 
         // Commit current layer summary changes.
-        layers_.info[currRank].baseBuffOffset += layerBuffBaseDelta;
-        layerBuffBaseDelta += layers_.info[currRank].capacityDeltaUpdate;   // changes of capacity of this layer affect buffOffset* of further layers.
-        layers_.info[currRank].capacityDeltaUpdate = 0;
-        layers_.info[currRank].schedSize = 0;
+        layer.baseBuffOffset += layerBuffBaseDelta;
+        layerBuffBaseDelta += layer.capacityDeltaUpdate;   // changes of capacity of this layer affect buffOffset* of further layers.
+        layer.capacityDeltaUpdate = 0;
+        layer.schedSize = 0;
     }
 
-    assert(calc::utils::toUnderlying(maxTouchedRank)+1 == calc::utils::makeSigned(layers_.info.size() - layers_.numOfNewLayers)
-           || layerBuffBaseDelta == 0);
+    if (schedulePopBuf) {
+        layers_.buff.pop_back();
+    }
+
+
+//    // Update value and ranks of predecessors.
+//    for (auto i = calc::utils::toUnderlying(originalRank) + 1; i <= calc::utils::toUnderlying(maxTouchedRank); ++i) {
+//        auto currRank = NodeRank{i};
+//        assert(currRank < layers_.info.rsize());
+
+//        assert(layers_.info[currRank].baseBuffOffset >= 0);
+
+//        auto wrBegin = layers_.buff.begin() + layers_.info[currRank].baseBuffOffset;
+//        auto wrEnd = wrBegin + layers_.info[currRank].schedSize;
+//        auto max = [](auto a, auto b) { return std::max(a, b); };
+//        maxTouchedRank = std::transform_reduce(/*std::execution::par, */wrBegin, wrEnd, maxTouchedRank, max, update);
+
+//        // Commit current layer summary changes.
+//        layers_.info[currRank].baseBuffOffset += layerBuffBaseDelta;
+//        layerBuffBaseDelta += layers_.info[currRank].capacityDeltaUpdate;   // changes of capacity of this layer affect buffOffset* of further layers.
+//        layers_.info[currRank].capacityDeltaUpdate = 0;
+//        layers_.info[currRank].schedSize = 0;
+//    }
+
+//    assert(calc::utils::toUnderlying(maxTouchedRank)+1 == calc::utils::makeSigned(layers_.info.size() - layers_.numOfNewLayers)
+//           || layerBuffBaseDelta == 0);
 
 //    for (auto i = maxTouchedRank + 1; i < layers_.info.size(); ++i) {
 
@@ -504,26 +569,26 @@ void CalcGraph::resetValueAt(NodeId nodeId, ValueType&& expr/*, ThreadPool& pool
 //        }
 //    }
 
-    // Adjust base buffer offsets of new layers (if any).
-    auto newLayersRBegin = layers_.info.rbegin();
-    auto newLayersREnd = newLayersRBegin + static_cast<std::ptrdiff_t>(layers_.numOfNewLayers);
-    layers_.numOfNewLayers = 0;
+//    // Adjust base buffer offsets of new layers (if any).
+//    auto newLayersRBegin = layers_.info.rbegin();
+//    auto newLayersREnd = newLayersRBegin + static_cast<std::ptrdiff_t>(layers_.numOfNewLayers);
+//    layers_.numOfNewLayers = 0;
 
-    std::size_t sumOfNodesInNextLayers = 0;
-    for (auto i = newLayersRBegin; i != newLayersREnd; ++i)  {
-        auto nodesOnLayer = i->capacityDeltaUpdate.load();
-        assert(nodesOnLayer >= 0);
-        sumOfNodesInNextLayers += calc::utils::makeUnsigned(nodesOnLayer);
-        i->capacityDeltaUpdate = 0;
-        i->baseBuffOffset = calc::utils::makeSigned(nodes_.size() - sumOfNodesInNextLayers);
-        assert(i->baseBuffOffset > 0);
-    }
+//    std::size_t sumOfNodesInNextLayers = 0;
+//    for (auto i = newLayersRBegin; i != newLayersREnd; ++i)  {
+//        auto nodesOnLayer = i->capacityDeltaUpdate.load();
+//        assert(nodesOnLayer >= 0);
+//        sumOfNodesInNextLayers += calc::utils::makeUnsigned(nodesOnLayer);
+//        i->capacityDeltaUpdate = 0;
+//        i->baseBuffOffset = calc::utils::makeSigned(nodes_.size() - sumOfNodesInNextLayers);
+//        assert(i->baseBuffOffset > 0);
+//    }
 
-    assert(
-        std::all_of(layers_.info.begin(), layers_.info.end(), [](const auto& e){
-            return e.capacityDeltaUpdate == 0 && e.schedSize == 0;
-        })
-    );
+//    assert(
+//        std::all_of(layers_.info.begin(), layers_.info.end(), [](const auto& e){
+//            return e.capacityDeltaUpdate == 0 && e.schedSize == 0;
+//        })
+//    );
 }
 
 //template<typename Container>
@@ -579,29 +644,29 @@ int main()
     namespace parser = calc::parser;
     namespace utils = calc::utils;
 
-//    ThreadPool pool;
+    ThreadPool pool;
     CalcGraph graph;
 
     using CellId = std::string;
     std::map<CellId, CalcGraph::NodeId, std::less<>> symbolTable;
 
-    auto getNode = [&graph, &symbolTable](auto cellId) {
+    auto getNode = [&graph, &symbolTable, &pool](auto cellId) {
         auto i = symbolTable.lower_bound(cellId);
         if (i == symbolTable.end() || i->first != cellId) {
-            auto n = graph.addNode(CalcGraph::Value{});
+            auto n = graph.addNode(CalcGraph::Value{}, pool);
             i = symbolTable.emplace_hint(i, cellId, n);
         }
         return i->second;
     };
 
-    auto resetNodeValue = [&graph, &symbolTable/*, &pool*/](auto cellId, auto&& value){
+    auto resetNodeValue = [&graph, &symbolTable, &pool](auto cellId, auto&& value){
         auto cellIter = symbolTable.lower_bound(cellId);
         if (cellIter == symbolTable.end() || cellIter->first != cellId) {
-            auto n = graph.addNode(std::forward<decltype(value)>(value));
+            auto n = graph.addNode(std::forward<decltype(value)>(value), pool);
             symbolTable.emplace_hint(cellIter, cellId, n);
         }
         else {
-            graph.resetValueAt(cellIter->second, std::forward<decltype(value)>(value)/*, pool*/);
+            graph.resetValueAt(cellIter->second, std::forward<decltype(value)>(value), pool);
         }
     };
 
