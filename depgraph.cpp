@@ -12,6 +12,8 @@
 #include <mutex>
 #include <condition_variable>
 #include <deque>
+#include <iterator>
+#include <any>
 #include "utils.h"
 #include "parser.h"
 
@@ -27,7 +29,7 @@ public:
 
         threads_.reserve(numOfThreads);
         for (auto i = numOfThreads; i; --i) {
-            threads_.emplace_back( [this]{ run_(); });
+            threads_.emplace_back( [this]{ runTh_(); });
         }
     }
 
@@ -49,27 +51,86 @@ public:
         }
     }
 
-    template<typename Callable, typename Cnt>
-    void apply(Callable&& func, const Cnt cnt)
+    template<
+        typename MapCallable,
+        typename ReduceCallable,
+        typename RaIt
+    >
+    auto mapReduce(MapCallable&& mapFunc, ReduceCallable&& reduceFunc, RaIt begin, RaIt end)
+    {
+        using RaItCategory = typename std::iterator_traits<RaIt>::iterator_category;
+        static_assert(std::is_same_v<RaItCategory, std::random_access_iterator_tag>);
+
+        auto procFunc = [&mapFunc, &reduceFunc, begin, this]() -> std::any {
+            auto c = --cnt_;
+
+            if (c > 0) {
+                cvThs_.notify_one();
+            }
+
+            if (c < 0) {
+                return {};
+            }
+
+            auto r = mapFunc(*std::next(begin, c));
+
+            for (; c >= 0; c = --cnt_) {
+                r = reduceFunc(r, mapFunc(*std::next(begin, c)));
+            }
+
+            return r;
+        };
+
+        using MapResultType = decltype(mapFunc(std::declval<typename std::iterator_traits<RaIt>::reference>()));
+        using ReduceResultType = decltype(reduceFunc(std::declval<MapResultType>(), std::declval<MapResultType>()));
+
+        ReduceResultType result;
+
+        auto submitFunc = [&reduceFunc, &result](std::any& r){
+            assert(r.has_value());
+            auto& v = std::any_cast<ReduceResultType&>(r);
+            result = reduceFunc(result, v);
+        };
+
+        runMain_(procFunc, submitFunc, std::distance(begin, end));
+        return result;
+    }
+
+private:
+    template<typename ProcCallable, typename SubmitCallable, typename Cnt>
+    void runMain_(ProcCallable& procFunc, SubmitCallable& submitFunc, const Cnt cnt)
     {
         assert(cnt >= 0);
         assert(cnt <= std::numeric_limits<decltype(cnt_)::value_type>::max());
+        proc_ = std::ref(procFunc);
+        submit_ = std::ref(submitFunc);
         cnt_ = cnt;
-        func_ = std::ref(func);
 
-        apply_();
+        auto r = proc_();
 
         std::unique_lock lck{mx_};
+
+        if (r.has_value()) {
+            submit_(r);
+        }
+
         cvMain_.wait(lck, [this]{
             return busyWorkerThreads_ == 0;
         });
     }
 
-private:
-    void run_()
+    void runTh_()
     {
+        std::any r;
+
         while(!stop_) {
             std::unique_lock lck{mx_};
+
+            if (r.has_value()) {
+                submit_(r);
+                r.reset();
+            }
+
             assert(busyWorkerThreads_ > 0);
             if (--busyWorkerThreads_ == 0) {
                 cvMain_.notify_one();
@@ -83,20 +144,7 @@ private:
             ++busyWorkerThreads_;
             lck.unlock();
 
-            apply_();
-        }
-    }
-
-    void apply_()
-    {
-        auto c = --cnt_;
-
-        if (c > 0) {
-            cvThs_.notify_one();
-        }
-
-        for (; c >= 0; c = --cnt_) {
-            func_(c);
+            r = proc_();
         }
     }
 
@@ -105,10 +153,12 @@ private:
     std::size_t busyWorkerThreads_;
     std::mutex mx_;
     std::vector<std::thread> threads_;
-    std::atomic<std::ptrdiff_t> cnt_ = 0;
     std::condition_variable cvThs_;
     std::condition_variable cvMain_;
-    std::function<void(std::ptrdiff_t)> func_;
+
+    std::function<std::any()> proc_;
+    std::function<void(std::any&)> submit_;
+    std::atomic<std::ptrdiff_t> cnt_ = 0;
 };
 
 struct NonAtomicallyMovableAtomicFlag  {
@@ -396,10 +446,8 @@ void CalcGraph::resetValueAt(NodeId nodeId, ValueType&& expr, ThreadPool& pool)
 
     assert(nodeId < nodes_.rsize());
 
-    // Add predecessors to layer.
+    // Add predecessors to layers.
     auto schedulePredsForProcessing = [this](NodeId id) {
-        NodeRank maxRank = NodeRank::Nil;
-
         // Populate layers (schedule processing of predecessors).
         for (auto predNodeId : nodes_[id].subscribedNodeIds()) {
             // Avoid cycles.
@@ -420,29 +468,27 @@ void CalcGraph::resetValueAt(NodeId nodeId, ValueType&& expr, ThreadPool& pool)
             auto layerBaseBuffOffset = layers_.info[predNodeRank].baseBuffOffset;
             assert(calc::utils::makeUnsigned(layerBaseBuffOffset + offset) < layers_.buff.size());
             layers_.buff[calc::utils::makeUnsigned(layerBaseBuffOffset + offset)] = predNodeId;
-            if (maxRank < predNodeRank) {
-                maxRank = predNodeRank;
-            }
         }
-        return maxRank;
     };
 
-
-    auto update = [this, graph=this, &schedulePredsForProcessing](NodeId id){
+    auto update = [this, graph=this, &schedulePredsForProcessing](NodeId id) {
         auto& node = nodes_[id];
 
-        auto originalRank = node.rank();
-
         node.isScheduledForIncrementalUpdate.clear();
-        node.fetchValueAndRank(*graph);
 
-        if (auto newRank = node.rank(); newRank != originalRank) {
+        const auto originalRank = node.rank();
+        node.fetchValueAndRank(*graph);
+        const auto newRank = node.rank();
+
+        if (newRank != originalRank) {
             assert(newRank < layers_.info.rsize());
             layers_.info[originalRank].capacityDeltaUpdate--;
             layers_.info[newRank].capacityDeltaUpdate++;
         }
 
-        return schedulePredsForProcessing(id);
+        schedulePredsForProcessing(id);
+
+        return std::max(newRank, originalRank);
     };
 
     stopNodes_.clear();
@@ -455,12 +501,10 @@ void CalcGraph::resetValueAt(NodeId nodeId, ValueType&& expr, ThreadPool& pool)
 
     auto& node = nodes_[nodeId];
     const auto originalRank = node.rank();
-
     node.reset(*this, nodeId, std::forward<ValueType>(expr));
-
     const auto newRank = node.rank();
 
-    // For each node with rank > 0 reserve one element in buf.
+    // Space in buff is only necessary for nodes with rank > 0.
     const auto schedulePopBuf = newRank < originalRank;
 
     if (newRank > originalRank) {
@@ -497,7 +541,7 @@ void CalcGraph::resetValueAt(NodeId nodeId, ValueType&& expr, ThreadPool& pool)
 
     // A point where to stop further processing (during processing of further layers this boundary may be changed
     // in a higher value).
-    /*auto maxTouchedRank = */schedulePredsForProcessing(nodeId);
+    schedulePredsForProcessing(nodeId);
 
 //    auto layerBuffBaseDelta = layers_.info[originalRank].capacityDeltaUpdate.load();
 //    layers_.info[originalRank].capacityDeltaUpdate = 0;
@@ -507,12 +551,10 @@ void CalcGraph::resetValueAt(NodeId nodeId, ValueType&& expr, ThreadPool& pool)
         assert(layer.baseBuffOffset >= 0);
 
         auto wrBegin = layers_.buff.begin() + layer.baseBuffOffset;
-//        auto wrEnd = wrBegin + layer.schedSize;
-//        auto max = [](auto a, auto b) { return std::max(a, b); };
+        auto wrEnd = wrBegin + layer.schedSize;
+        auto max = [](auto a, auto b) { return std::max(a, b); };
 //        std::transform_reduce(/*std::execution::par, */wrBegin, wrEnd, maxTouchedRank, max, update);
-        pool.apply([&update, &wrBegin](auto i){
-            update(*std::next(wrBegin, i));
-        }, layer.schedSize.load());
+        pool.mapReduce(update, max, wrBegin, wrEnd);
 
         // Commit current layer summary changes.
         layer.baseBuffOffset += layerBuffBaseDelta;
