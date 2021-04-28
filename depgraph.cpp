@@ -54,9 +54,10 @@ public:
     template<
         typename MapCallable,
         typename ReduceCallable,
-        typename RaIt
+        typename RaIt,
+        typename InitValue
     >
-    auto mapReduce(MapCallable&& mapFunc, ReduceCallable&& reduceFunc, RaIt begin, RaIt end)
+    auto mapReduce(RaIt begin, RaIt end, InitValue&& value, MapCallable&& mapFunc, ReduceCallable&& reduceFunc)
     {
         using RaItCategory = typename std::iterator_traits<RaIt>::iterator_category;
         static_assert(std::is_same_v<RaItCategory, std::random_access_iterator_tag>);
@@ -84,7 +85,7 @@ public:
         using MapResultType = decltype(mapFunc(std::declval<typename std::iterator_traits<RaIt>::reference>()));
         using ReduceResultType = decltype(reduceFunc(std::declval<MapResultType>(), std::declval<MapResultType>()));
 
-        ReduceResultType result;
+        ReduceResultType result{std::forward<InitValue>(value)};
 
         auto submitFunc = [&reduceFunc, &result](std::any& r){
             assert(r.has_value());
@@ -448,6 +449,9 @@ void CalcGraph::resetValueAt(NodeId nodeId, ValueType&& expr, ThreadPool& pool)
 
     // Add predecessors to layers.
     auto schedulePredsForProcessing = [this](NodeId id) {
+        auto minTouchedRank = NodeRank::Nil;
+        auto maxTouchedRank = NodeRank::Nil;
+
         // Populate layers (schedule processing of predecessors).
         for (auto predNodeId : nodes_[id].subscribedNodeIds()) {
             // Avoid cycles.
@@ -460,6 +464,9 @@ void CalcGraph::resetValueAt(NodeId nodeId, ValueType&& expr, ThreadPool& pool)
             auto predNodeRank = nodes_[predNodeId].rank();
             assert(predNodeRank != NodeRank::Nil);
 
+            std::tie(minTouchedRank, maxTouchedRank) =
+                    std::minmax({minTouchedRank, maxTouchedRank, predNodeRank});
+
             if (auto& predNode = nodes_[predNodeId]; predNode.isScheduledForIncrementalUpdate.testAndSet()) {
                 continue;
             }
@@ -469,6 +476,8 @@ void CalcGraph::resetValueAt(NodeId nodeId, ValueType&& expr, ThreadPool& pool)
             assert(calc::utils::makeUnsigned(layerBaseBuffOffset + offset) < layers_.buff.size());
             layers_.buff[calc::utils::makeUnsigned(layerBaseBuffOffset + offset)] = predNodeId;
         }
+
+        return std::pair{minTouchedRank, maxTouchedRank};
     };
 
     auto update = [this, graph=this, &schedulePredsForProcessing](NodeId id) {
@@ -507,6 +516,9 @@ void CalcGraph::resetValueAt(NodeId nodeId, ValueType&& expr, ThreadPool& pool)
     // Space in buff is only necessary for nodes with rank > 0.
     const auto schedulePopBuf = newRank < originalRank;
 
+    auto rankToStartFrom = originalRank;
+    auto maxTouchedRank = newRank;
+
     if (newRank > originalRank) {
         // For each node with rank > 0 reserve one element in buf.
         if (originalRank == NodeRank::Nil) {
@@ -529,32 +541,65 @@ void CalcGraph::resetValueAt(NodeId nodeId, ValueType&& expr, ThreadPool& pool)
         if (originalRank != NodeRank::Nil) {
             layers_.info[originalRank].capacityDeltaUpdate--;
         }
+        else {
+           rankToStartFrom = newRank;
+           assert(!layers_.info.empty() && "There must be at least one layer corresponding to newRank");
+           maxTouchedRank = static_cast<NodeRank>(layers_.info.size() - 1);
+        }
     }
     else if (newRank < originalRank){
+        rankToStartFrom = newRank;
+        maxTouchedRank = originalRank;
+
         layers_.info[originalRank].capacityDeltaUpdate--;
 
         // Nil rank elements don't have dedicated element in layers_ structure.
         if (newRank != NodeRank::Nil) {
             layers_.info[newRank].capacityDeltaUpdate++;
         }
+        else {
+            assert(!layers_.info.empty() && "There must be at least one layer corresponding to originalRank");
+            maxTouchedRank = static_cast<NodeRank>(layers_.info.size() - 1);
+        }
     }
 
-    // A point where to stop further processing (during processing of further layers this boundary may be changed
-    // in a higher value).
-    schedulePredsForProcessing(nodeId);
+    auto [mi, ma] = schedulePredsForProcessing(nodeId);
 
-//    auto layerBuffBaseDelta = layers_.info[originalRank].capacityDeltaUpdate.load();
-//    layers_.info[originalRank].capacityDeltaUpdate = 0;
+
+    if (rankToStartFrom == NodeRank::Nil) {
+        if (mi == NodeRank::Nil) {
+            // Move rankToStartFrom to a valid range ranks (low boundary) to iterate over layers.
+            rankToStartFrom = NodeRank{0};
+        }
+        else {
+            rankToStartFrom = mi;
+        }
+    }
+    else if (mi == NodeRank::Nil) {
+        rankToStartFrom = NodeRank{0};
+    }
+    else {
+        rankToStartFrom = std::min(rankToStartFrom, mi);
+    }
+
+    maxTouchedRank = std::max(maxTouchedRank, ma);
+
+
 
     auto layerBuffBaseDelta = std::ptrdiff_t{0};
-    for (auto& layer : layers_.info) {
+    for (auto i = calc::utils::toUnderlying(rankToStartFrom); i <= calc::utils::toUnderlying(maxTouchedRank); ++i) {
+        auto currRank = NodeRank{i};
+        assert(currRank < layers_.info.rsize());
+        auto& layer = layers_.info[currRank];
         assert(layer.baseBuffOffset >= 0);
 
-        auto wrBegin = layers_.buff.begin() + layer.baseBuffOffset;
-        auto wrEnd = wrBegin + layer.schedSize;
-        auto max = [](auto a, auto b) { return std::max(a, b); };
-//        std::transform_reduce(/*std::execution::par, */wrBegin, wrEnd, maxTouchedRank, max, update);
-        pool.mapReduce(update, max, wrBegin, wrEnd);
+        if (layer.schedSize > 0) {
+            auto wrBegin = layers_.buff.begin() + layer.baseBuffOffset;
+            auto wrEnd = wrBegin + layer.schedSize;
+            auto max = [](auto a, auto b) { return std::max(a, b); };
+    //        std::transform_reduce(/*std::execution::par, */wrBegin, wrEnd, maxTouchedRank, max, update);
+            maxTouchedRank = pool.mapReduce(wrBegin, wrEnd, NodeRank{0}, update, max);
+        }
 
         // Commit current layer summary changes.
         layer.baseBuffOffset += layerBuffBaseDelta;

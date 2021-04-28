@@ -38,11 +38,24 @@ target_sources(depgraph
     PRIVATE
     depgraph.cpp)
 
+#target_compile_options(depgraph
+#    PRIVATE
+#    -fsanitize=address
+#    -fsanitize=undefined
+#    -fno-omit-frame-pointer)
+
+
+#target_link_options(depgraph
+#    PRIVATE
+#    -fsanitize=address
+#    -fsanitize=undefined
+#    -fno-omit-frame-pointer)
+
 find_package(Threads REQUIRED)
+
 target_link_libraries(depgraph
     PRIVATE
     Threads::Threads)
-
 
 
 
