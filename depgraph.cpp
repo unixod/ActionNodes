@@ -226,7 +226,6 @@ public:
         static_assert(vtIsExprOrValue, "ValueType must be either CalcGraph::Value or CalcGraph::Expression.");
 
         auto nodeId = NodeId{nodes_.size()};
-//        nodes_.emplace_back(*this, nodeId, std::move(expr));
         nodes_.emplace_back(*this, nodeId, Value{});
 
         resetValueAt(nodeId, std::forward<ValueType>(expr), pool);
@@ -584,8 +583,6 @@ void CalcGraph::resetValueAt(NodeId nodeId, ValueType&& expr, ThreadPool& pool)
 
     maxTouchedRank = std::max(maxTouchedRank, ma);
 
-
-
     auto layerBuffBaseDelta = std::ptrdiff_t{0};
     for (auto i = calc::utils::toUnderlying(rankToStartFrom); i <= calc::utils::toUnderlying(maxTouchedRank); ++i) {
         auto currRank = NodeRank{i};
@@ -597,8 +594,7 @@ void CalcGraph::resetValueAt(NodeId nodeId, ValueType&& expr, ThreadPool& pool)
             auto wrBegin = layers_.buff.begin() + layer.baseBuffOffset;
             auto wrEnd = wrBegin + layer.schedSize;
             auto max = [](auto a, auto b) { return std::max(a, b); };
-    //        std::transform_reduce(/*std::execution::par, */wrBegin, wrEnd, maxTouchedRank, max, update);
-            maxTouchedRank = pool.mapReduce(wrBegin, wrEnd, NodeRank{0}, update, max);
+            maxTouchedRank = pool.mapReduce(wrBegin, wrEnd, maxTouchedRank, update, max);
         }
 
         // Commit current layer summary changes.
@@ -611,114 +607,7 @@ void CalcGraph::resetValueAt(NodeId nodeId, ValueType&& expr, ThreadPool& pool)
     if (schedulePopBuf) {
         layers_.buff.pop_back();
     }
-
-
-//    // Update value and ranks of predecessors.
-//    for (auto i = calc::utils::toUnderlying(originalRank) + 1; i <= calc::utils::toUnderlying(maxTouchedRank); ++i) {
-//        auto currRank = NodeRank{i};
-//        assert(currRank < layers_.info.rsize());
-
-//        assert(layers_.info[currRank].baseBuffOffset >= 0);
-
-//        auto wrBegin = layers_.buff.begin() + layers_.info[currRank].baseBuffOffset;
-//        auto wrEnd = wrBegin + layers_.info[currRank].schedSize;
-//        auto max = [](auto a, auto b) { return std::max(a, b); };
-//        maxTouchedRank = std::transform_reduce(/*std::execution::par, */wrBegin, wrEnd, maxTouchedRank, max, update);
-
-//        // Commit current layer summary changes.
-//        layers_.info[currRank].baseBuffOffset += layerBuffBaseDelta;
-//        layerBuffBaseDelta += layers_.info[currRank].capacityDeltaUpdate;   // changes of capacity of this layer affect buffOffset* of further layers.
-//        layers_.info[currRank].capacityDeltaUpdate = 0;
-//        layers_.info[currRank].schedSize = 0;
-//    }
-
-//    assert(calc::utils::toUnderlying(maxTouchedRank)+1 == calc::utils::makeSigned(layers_.info.size() - layers_.numOfNewLayers)
-//           || layerBuffBaseDelta == 0);
-
-//    for (auto i = maxTouchedRank + 1; i < layers_.info.size(); ++i) {
-
-//    }
-
-//    // If the layer corresponding to the newRank of the node hasn't been
-//    // processed then check and if necessasry adjust base buf offset
-//    // of this and all rest layers.
-//    if (auto newRank = node.rank(); layers_.info[newRank].capacityDeltaUpdate != 0) {
-//        assert(layers_.info[newRank].capacityDeltaUpdate > 0);
-
-//        layerBuffBaseDelta = layers_.info[newRank].capacityDeltaUpdate;
-//        auto lBegin = layers_.info.begin() + calc::utils::toUnderlying(newRank);
-//        auto lEnd = layers_.info.end();
-//        for (auto i = lBegin; i != lEnd; ++i) {
-//            assert(i->schedSize == 0);
-//            i->baseBuffOffset += layerBuffBaseDelta;
-//            layerBuffBaseDelta += i->capacityDeltaUpdate;
-//            i->capacityDeltaUpdate = 0;
-//        }
-//    }
-
-//    // Adjust base buffer offsets of new layers (if any).
-//    auto newLayersRBegin = layers_.info.rbegin();
-//    auto newLayersREnd = newLayersRBegin + static_cast<std::ptrdiff_t>(layers_.numOfNewLayers);
-//    layers_.numOfNewLayers = 0;
-
-//    std::size_t sumOfNodesInNextLayers = 0;
-//    for (auto i = newLayersRBegin; i != newLayersREnd; ++i)  {
-//        auto nodesOnLayer = i->capacityDeltaUpdate.load();
-//        assert(nodesOnLayer >= 0);
-//        sumOfNodesInNextLayers += calc::utils::makeUnsigned(nodesOnLayer);
-//        i->capacityDeltaUpdate = 0;
-//        i->baseBuffOffset = calc::utils::makeSigned(nodes_.size() - sumOfNodesInNextLayers);
-//        assert(i->baseBuffOffset > 0);
-//    }
-
-//    assert(
-//        std::all_of(layers_.info.begin(), layers_.info.end(), [](const auto& e){
-//            return e.capacityDeltaUpdate == 0 && e.schedSize == 0;
-//        })
-//    );
 }
-
-//template<typename Container>
-//void CalcGraph::refresh(Container&& nodeIds, ThreadPool& exec)
-//{
-//    using IteratorType = typename std::decay_t<Container>::iterator;
-//    static_assert(std::is_same_v<typename std::iterator_traits<IteratorType>::value_type, NodeId>,
-//            "The function refresh expects a sequence of NodeId on input.");
-
-
-//    auto proc = [this, &exec](auto self, NodeId id) {
-//        auto& node = nodes_[utils::toUnderlying(id)];
-
-//        if (node.refs-- == 0) {
-//            node.expr.recalcValue();
-
-//            // This node value is ready to read by dependant nodes,
-//            // hence enqueue dependent node for similar processing.
-//            for (auto& nodeId : node.dependentNodes()) {
-//                exec.runAsync([self, nodeId]{
-//                    self(self, nodeId);
-//                });
-//            }
-//        }
-//    };
-
-//    for (auto& nodeId : nodeIds) {
-//        exec.runAsync([nodeId, proc]{
-//            proc(proc, nodeId);
-//        });
-//    }
-
-//    exec.wait();
-//}
-//void CalcGraph::addDependency(CalcGraph::NodeId nodeId, CalcGraph::NodeId depNodeId)
-//{
-//    assert(toUnderlying(nodeId) < nodes_.size());
-//    assert(toUnderlying(depNodeId) < nodes_.size());
-
-//    auto& node = nodes_[toUnderlying(nodeId)];
-//    auto& depNode = nodes_[toUnderlying(depNodeId)];
-//    depNode.scheduleUpdate(node);
-//}
 
 CalcGraph::Value CalcGraph::getValueAt(CalcGraph::NodeId nodeId) const
 {
