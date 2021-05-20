@@ -1,5 +1,5 @@
 ##################################################
-# Define anodes::compile_options - a target
+# Define anodes::compile-options - a target
 # representing a set of common compile options
 # for a project.
 ##################################################
