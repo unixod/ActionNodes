@@ -1,61 +1,36 @@
-cmake_minimum_required(VERSION 3.13)
+cmake_minimum_required(VERSION 3.16)
 
-project(depgraph VERSION 1.0.0)
+project(action-nodes
+    VERSION 1.0.0
+    LANGUAGES CXX
+)
 
-set(CMAKE_CXX_STANDARD 17)
-set(CMAKE_CXX_STANDARD_REQUIRED ON)
-set(CMAKE_CXX_EXTENSIONS OFF)
+include(GNUInstallDirs)
 
+##############################################################################
+# Setup project general properties
+##############################################################################
 
-# Common compile options.
-if (MSVC)
-    add_compile_options(
-        /EHsc
-        /W4
-        /WX
-    )
-else()
-    add_compile_options(
-        -Wall
-        -Wcast-align
-        -Wconversion
-        -Wctor-dtor-privacy
-        -Werror
-        -Wextra
-        -Wno-unknown-attributes
-        -Wnon-virtual-dtor
-        -Wold-style-cast
-        -Woverloaded-virtual
-        -Wpedantic
-        -Wshadow
-        -Wsign-conversion
-    )
+# Check if this is a standalone project or included by other project
+if(CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
+    set(ACTION_NODES_STANDALONE On)
 endif()
 
-add_executable(depgraph)
+# Although this library is supposed to be dependency free its unit tests
+# are based on Catch2 unit test framework. Specifying CMAKE_CXX_STANDARD
+# in the following block is necessary for correct building of and linking
+# with Catch2 and potentialy any other fetched dependency because they
+# need to be informed somehow about the C++ standard being used.
+if(ACTION_NODES_STANDALONE AND NOT DEFINED CMAKE_CXX_STANDARD)
+    set(CMAKE_CXX_STANDARD 20)
+    set(CMAKE_CXX_STANDARD_REQUIRED ON)
+    set(CMAKE_CXX_EXTENSIONS OFF)
+endif()
 
-target_sources(depgraph
-    PRIVATE
-    depgraph.cpp)
+option(ACTION_NODES_INSTALL "Enable installation of action-nodes target" ACTION_NODES_STANDALONE)
 
-#target_compile_options(depgraph
-#    PRIVATE
-#    -fsanitize=address
-#    -fsanitize=undefined
-#    -fno-omit-frame-pointer)
+include(compile-options.cmake)
+include(deps-config.cmake)
 
-
-#target_link_options(depgraph
-#    PRIVATE
-#    -fsanitize=address
-#    -fsanitize=undefined
-#    -fno-omit-frame-pointer)
-
-find_package(Threads REQUIRED)
-
-target_link_libraries(depgraph
-    PRIVATE
-    Threads::Threads)
-
-
-
+add_subdirectory(bench-cli)
+add_subdirectory(graph)

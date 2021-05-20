@@ -1,3 +1,7 @@
+#ifndef ACTION_NODES_GRAPH_H
+#define ACTION_NODES_GRAPH_H
+
+#include <cassert>
 #include <iostream>
 #include <algorithm>
 #include <cassert>
@@ -14,9 +18,10 @@
 #include <deque>
 #include <iterator>
 #include <any>
-#include "utils.h"
-#include "parser.h"
+#include <ez/support/c++23-features.h>
+#include <ez/utils/utils.h>
 
+namespace anodes {
 
 class ThreadPool {
 public:
@@ -162,6 +167,125 @@ private:
     std::atomic<std::ptrdiff_t> cnt_ = 0;
 };
 
+
+template<typename T>
+class Badge {
+    constexpr Badge() {};   // replace {} with = default since C++20.
+    friend T;
+};
+
+template<typename T, typename Idx, typename Allocator = std::allocator<T>>
+struct RIVector : std::vector<T, Allocator> {
+private:
+    using Base = std::vector<T>;
+    using SizeType = typename Base::size_type;
+
+//    class S {
+//    public:
+//        S(SizeType s, Badge<RIVector>)
+//            : s_{s}
+//        {}
+
+//        operator SizeType() const noexcept
+//        {
+//            return s_;
+//        }
+
+//        operator Idx() const noexcept
+//        {
+//            assert(s_ < std::numeric_limits<std::underlying_type_t<Idx>>::max());
+
+//            return static_cast<Idx>(s_);
+//        }
+
+//    private:
+//        SizeType s_;
+//    };
+
+public:
+    using Base::Base;
+
+    auto& operator[](Idx idx)
+    {
+        assert(ez::std23::to_underlying(idx) >= 0);
+        assert(ez::utils::toUnsigned(ez::std23::to_underlying(idx)) < std::numeric_limits<SizeType>::max());
+
+        return Base::operator[](ez::utils::toUnsigned(ez::std23::to_underlying(idx)));
+    }
+
+    auto& operator[](Idx idx) const
+    {
+        assert(ez::std23::to_underlying(idx) >= 0);
+        assert(ez::utils::toUnsigned(ez::std23::to_underlying(idx)) < std::numeric_limits<SizeType>::max());
+
+        return Base::operator[](ez::utils::toUnsigned(ez::std23::to_underlying(idx)));
+    }
+
+    Idx rsize() const noexcept
+    {
+        assert(Base::size() < std::numeric_limits<std::underlying_type_t<Idx>>::max());
+
+        return static_cast<Idx>(Base::size());
+    }
+};
+
+template<typename T>
+struct SparseSet {
+    static_assert(std::is_integral_v<T> || std::is_enum_v<T>);
+
+public:
+    SparseSet() = default;
+
+    SparseSet(std::size_t size)
+        : sparseSet_(size)
+    {}
+
+    void set(T v)
+    {
+        if (contains(v)) {
+            return;
+        }
+
+        if (v >= sparseSet_.rsize()) {
+            sparseSet_.resize(ez::std23::to_underlying(v)+1);
+        }
+
+        sparseSet_[v] = top_;
+
+        if (top_ == denseSet_.size()) {
+            denseSet_.push_back(v);
+        }
+        else {
+            assert(top_ < denseSet_.size());
+            denseSet_[top_] = v;
+        }
+
+        ++top_;
+    }
+
+    bool contains(T v)
+    {
+        assert(top_ <= denseSet_.size());
+
+        if (v >= sparseSet_.rsize()) {
+            return false;
+        }
+
+        auto denseId = sparseSet_[v];
+        return denseId < top_ && denseSet_[denseId] == v;
+    }
+
+    void clear()
+    {
+        top_ = 0;
+    }
+
+private:
+    std::size_t top_ = 0;
+    std::vector<T> denseSet_;
+    RIVector<std::size_t, T> sparseSet_;
+};
+
 struct NonAtomicallyMovableAtomicFlag  {
     NonAtomicallyMovableAtomicFlag() = default;
 
@@ -210,7 +334,7 @@ public:
 
     class Expression;
     enum class Value : std::int64_t {};
-    
+
     template<typename T>
     using IsExpression = std::is_same<std::decay_t<T>, Expression>;
 
@@ -238,8 +362,8 @@ public:
     Value getValueAt(NodeId) const;
 
 private:
-    calc::utils::RIVector<Node, NodeId> nodes_;
-    calc::utils::SparseSet<NodeId> stopNodes_;       // Used in resetValueAt for handle possible cycles.
+    RIVector<Node, NodeId> nodes_;
+    SparseSet<NodeId> stopNodes_;       // Used in resetValueAt for handle possible cycles.
 
 
     struct LayerInfo {
@@ -280,7 +404,7 @@ private:
 
     struct Layers {
         std::vector<NodeId> buff;
-        calc::utils::RIVector<LayerInfo, NodeRank> info;
+        RIVector<LayerInfo, NodeRank> info;
     };
 
     Layers layers_;
@@ -288,7 +412,7 @@ private:
 
     friend auto operator - (NodeRank lhs, NodeRank rhs) noexcept
     {
-        return calc::utils::toUnderlying(lhs) - calc::utils::toUnderlying(rhs);
+        return ez::std23::to_underlying(lhs) - ez::std23::to_underlying(rhs);
     }
 };
 
@@ -315,7 +439,7 @@ public:
         std::underlying_type_t<Value> sum{};
 
         for (auto& m : nodes_) {
-            sum += calc::utils::toUnderlying(graph.getValueAt(m));
+            sum += ez::std23::to_underlying(graph.getValueAt(m));
         }
 
         return Value{sum};
@@ -421,7 +545,7 @@ private:
             rank = std::max(rank, depNode.rank_);
         }
 
-        return NodeRank{calc::utils::toUnderlying(rank) + 1};
+        return NodeRank{ez::std23::to_underlying(rank) + 1};
     }
 
 private:
@@ -472,8 +596,8 @@ void CalcGraph::resetValueAt(NodeId nodeId, ValueType&& expr, ThreadPool& pool)
 
             auto offset = layers_.info[predNodeRank].schedSize++;
             auto layerBaseBuffOffset = layers_.info[predNodeRank].baseBuffOffset;
-            assert(calc::utils::makeUnsigned(layerBaseBuffOffset + offset) < layers_.buff.size());
-            layers_.buff[calc::utils::makeUnsigned(layerBaseBuffOffset + offset)] = predNodeId;
+            assert(ez::utils::toUnsigned(layerBaseBuffOffset + offset) < layers_.buff.size());
+            layers_.buff[ez::utils::toUnsigned(layerBaseBuffOffset + offset)] = predNodeId;
         }
 
         return std::pair{minTouchedRank, maxTouchedRank};
@@ -526,7 +650,7 @@ void CalcGraph::resetValueAt(NodeId nodeId, ValueType&& expr, ThreadPool& pool)
 
         // Add more layer descriptors if node is moved beyoud the current set of layers.
         assert(layers_.info.size() <= nodes_.size());
-        const auto rankDiff = calc::utils::makeUnsigned(newRank - originalRank);
+        const auto rankDiff = ez::utils::toUnsigned(newRank - originalRank);
         const auto layersCntToAdd = std::min<std::size_t>(rankDiff,  nodes_.size() - layers_.info.size());
 
         if (layersCntToAdd > 0) {
@@ -584,7 +708,7 @@ void CalcGraph::resetValueAt(NodeId nodeId, ValueType&& expr, ThreadPool& pool)
     maxTouchedRank = std::max(maxTouchedRank, ma);
 
     auto layerBuffBaseDelta = std::ptrdiff_t{0};
-    for (auto i = calc::utils::toUnderlying(rankToStartFrom); i <= calc::utils::toUnderlying(maxTouchedRank); ++i) {
+    for (auto i = ez::std23::to_underlying(rankToStartFrom); i <= ez::std23::to_underlying(maxTouchedRank); ++i) {
         auto currRank = NodeRank{i};
         assert(currRank < layers_.info.rsize());
         auto& layer = layers_.info[currRank];
@@ -614,60 +738,6 @@ CalcGraph::Value CalcGraph::getValueAt(CalcGraph::NodeId nodeId) const
     assert(nodeId < nodes_.rsize());
     return nodes_[nodeId].value();
 }
-
-int main()
-{
-    namespace parser = calc::parser;
-    namespace utils = calc::utils;
-
-    ThreadPool pool;
-    CalcGraph graph;
-
-    using CellId = std::string;
-    std::map<CellId, CalcGraph::NodeId, std::less<>> symbolTable;
-
-    auto getNode = [&graph, &symbolTable, &pool](auto cellId) {
-        auto i = symbolTable.lower_bound(cellId);
-        if (i == symbolTable.end() || i->first != cellId) {
-            auto n = graph.addNode(CalcGraph::Value{}, pool);
-            i = symbolTable.emplace_hint(i, cellId, n);
-        }
-        return i->second;
-    };
-
-    auto resetNodeValue = [&graph, &symbolTable, &pool](auto cellId, auto&& value){
-        auto cellIter = symbolTable.lower_bound(cellId);
-        if (cellIter == symbolTable.end() || cellIter->first != cellId) {
-            auto n = graph.addNode(std::forward<decltype(value)>(value), pool);
-            symbolTable.emplace_hint(cellIter, cellId, n);
-        }
-        else {
-            graph.resetValueAt(cellIter->second, std::forward<decltype(value)>(value), pool);
-        }
-    };
-
-    for (std::string line; std::getline(std::cin, line) && !line.empty();) {
-        auto [cellId, cellExpr] = parser::parseLine(line);
-
-        utils::match(cellExpr,
-            [&resetNodeValue, cellId = cellId](parser::Number n) {
-                resetNodeValue(cellId, CalcGraph::Value{n});
-            },
-            [&getNode, &resetNodeValue, cellId = cellId](const parser::CellsSum& sum) {
-                std::vector<CalcGraph::NodeId> cs;
-                for (auto sumMemberCellId : sum) {
-                    cs.push_back(getNode(sumMemberCellId));
-                }
-                resetNodeValue(cellId, CalcGraph::Expression{std::move(cs)});
-            }
-        );
-    }
-
-    for (auto& [cellId, nodeId] : symbolTable) {
-        std::cout << cellId << '=' << utils::toUnderlying(graph.getValueAt(nodeId)) << '\n';
-    }
-
-    return EXIT_SUCCESS;
 }
 
-
+#endif // ACTION_NODES_GRAPH_H

@@ -8,7 +8,7 @@
 #include <cassert>
 #include <tuple>
 
-namespace calc::parser {
+namespace anodes::bench_cli::parser {
 
 using CellsSum = std::vector<std::string_view>;
 using Number = std::int64_t;
@@ -75,6 +75,6 @@ parseLine(std::string_view line)
     }
 }
 
-} // namespace calc::parser
+} // namespace anodes::bench_cli::parser
 
 #endif // PARSER_H
