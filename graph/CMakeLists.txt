@@ -1,5 +1,5 @@
 ##############################################################################
-# Setup action-nodes::action-nodes target
+# Setup action::graph target
 ##############################################################################
 add_library(anodes-graph INTERFACE)
 add_library(anodes::graph ALIAS anodes-graph)
@@ -14,6 +14,7 @@ find_package(Threads REQUIRED)
 target_link_libraries(anodes-graph
     INTERFACE
     Threads::Threads
+    anodes::utils
     anodes::compile-options)
 
 ##############################################################################

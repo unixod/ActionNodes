@@ -17,5 +17,5 @@ FetchContent_Declare(ez-utils
     GIT_SHALLOW On
 )
 
-
 FetchContent_MakeAvailable(ez-support ez-utils)
+

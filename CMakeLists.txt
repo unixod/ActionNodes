@@ -32,5 +32,7 @@ option(ACTION_NODES_INSTALL "Enable installation of action-nodes target" ACTION_
 include(compile-options.cmake)
 include(deps-config.cmake)
 
-add_subdirectory(bench-cli)
+
 add_subdirectory(graph)
+add_subdirectory(utils)
+add_subdirectory(bench-cli)

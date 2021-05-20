@@ -1,5 +1,6 @@
 #include <ez/support/c++23-features.h>
 #include "action-nodes/graph.h"
+#include "action-nodes/utils/thread-pool.h"
 #include "action-nodes/bench-cli/parser.h"
 
 namespace anodes::bench_cli::utils {
@@ -20,14 +21,15 @@ decltype(auto) match(Visitor&& v, Callable&&... func)
 
 }
 
-
+using anodes::utils::ThreadPool;
 using anodes::CalcGraph;
+
 int main()
 {
     namespace parser = anodes::bench_cli::parser;
     namespace utils = anodes::bench_cli::utils;
 
-    anodes::ThreadPool pool;
+    ThreadPool pool;
     CalcGraph graph;
 
     using CellId = std::string;
