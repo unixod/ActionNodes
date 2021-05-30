@@ -2,25 +2,14 @@
 #define ACTION_NODES_GRAPH_H
 
 #include <cassert>
-#include <iostream>
 #include <algorithm>
-#include <cassert>
 #include <atomic>
 #include <numeric>
 #include <type_traits>
-#include <execution>
-#include <thread>
-#include <vector>
-#include <string>
-#include <map>
-#include <mutex>
-#include <condition_variable>
-#include <deque>
-#include <iterator>
-#include <any>
-#include "action-nodes/utils/thread-pool.h"
-#include <ez/support/c++23-features.h>
+#include <ez/support/std23.h>
 #include <ez/utils/utils.h>
+#include <ez/utils/enum-arithmetic.h>
+#include "action-nodes/utils/thread-pool.h"
 
 namespace anodes {
 
@@ -64,18 +53,18 @@ public:
 
     auto& operator[](Idx idx)
     {
-        assert(ez::std23::to_underlying(idx) >= 0);
-        assert(ez::utils::toUnsigned(ez::std23::to_underlying(idx)) < std::numeric_limits<SizeType>::max());
+        assert(ez::support::std23::to_underlying(idx) >= 0);
+        assert(ez::utils::toUnsigned(ez::support::std23::to_underlying(idx)) < std::numeric_limits<SizeType>::max());
 
-        return Base::operator[](ez::utils::toUnsigned(ez::std23::to_underlying(idx)));
+        return Base::operator[](ez::utils::toUnsigned(ez::support::std23::to_underlying(idx)));
     }
 
     auto& operator[](Idx idx) const
     {
-        assert(ez::std23::to_underlying(idx) >= 0);
-        assert(ez::utils::toUnsigned(ez::std23::to_underlying(idx)) < std::numeric_limits<SizeType>::max());
+        assert(ez::support::std23::to_underlying(idx) >= 0);
+        assert(ez::utils::toUnsigned(ez::support::std23::to_underlying(idx)) < std::numeric_limits<SizeType>::max());
 
-        return Base::operator[](ez::utils::toUnsigned(ez::std23::to_underlying(idx)));
+        return Base::operator[](ez::utils::toUnsigned(ez::support::std23::to_underlying(idx)));
     }
 
     Idx rsize() const noexcept
@@ -104,7 +93,7 @@ public:
         }
 
         if (v >= sparseSet_.rsize()) {
-            sparseSet_.resize(ez::std23::to_underlying(v)+1);
+            sparseSet_.resize(ez::support::std23::to_underlying(v)+1);
         }
 
         sparseSet_[v] = top_;
@@ -184,13 +173,14 @@ private:
 
 class CalcGraph {
 public:
-    class Node;
-    enum class NodeRank {Nil = -1};
-
     enum class NodeId : std::size_t {};
 
     class Expression;
     enum class Value : std::int64_t {};
+
+private:
+    class Node;
+    enum class NodeRank {Nil = -1};
 
     template<typename T>
     using IsExpression = std::is_same<std::decay_t<T>, Expression>;
@@ -265,14 +255,14 @@ private:
     };
 
     Layers layers_;
-
-
-    friend auto operator - (NodeRank lhs, NodeRank rhs) noexcept
-    {
-        return ez::std23::to_underlying(lhs) - ez::std23::to_underlying(rhs);
-    }
 };
 
+} //  anodes
+
+template<>
+struct ez::utils::EnableEnumArithmeticFor<anodes::CalcGraph::NodeRank>{};
+
+namespace anodes {
 class CalcGraph::Expression {
 public:
     Expression() = default;
@@ -296,7 +286,7 @@ public:
         std::underlying_type_t<Value> sum{};
 
         for (auto& m : nodes_) {
-            sum += ez::std23::to_underlying(graph.getValueAt(m));
+            sum += ez::support::std23::to_underlying(graph.getValueAt(m));
         }
 
         return Value{sum};
@@ -402,7 +392,8 @@ private:
             rank = std::max(rank, depNode.rank_);
         }
 
-        return NodeRank{ez::std23::to_underlying(rank) + 1};
+        using namespace ez::utils::enum_arithmethic;
+        return rank + 1;
     }
 
 private:
@@ -417,6 +408,7 @@ private:
 public:
     NonAtomicallyMovableAtomicFlag isScheduledForIncrementalUpdate;
 };
+
 
 template<typename ValueType>
 void CalcGraph::resetValueAt(NodeId nodeId, ValueType&& expr, utils::ThreadPool& pool)
@@ -507,7 +499,8 @@ void CalcGraph::resetValueAt(NodeId nodeId, ValueType&& expr, utils::ThreadPool&
 
         // Add more layer descriptors if node is moved beyoud the current set of layers.
         assert(layers_.info.size() <= nodes_.size());
-        const auto rankDiff = ez::utils::toUnsigned(newRank - originalRank);
+        using namespace ez::utils::enum_arithmethic;
+        const auto rankDiff = ez::utils::toUnsigned(ez::support::std23::to_underlying(newRank - originalRank));
         const auto layersCntToAdd = std::min<std::size_t>(rankDiff,  nodes_.size() - layers_.info.size());
 
         if (layersCntToAdd > 0) {
@@ -565,7 +558,8 @@ void CalcGraph::resetValueAt(NodeId nodeId, ValueType&& expr, utils::ThreadPool&
     maxTouchedRank = std::max(maxTouchedRank, ma);
 
     auto layerBuffBaseDelta = std::ptrdiff_t{0};
-    for (auto i = ez::std23::to_underlying(rankToStartFrom); i <= ez::std23::to_underlying(maxTouchedRank); ++i) {
+    using namespace ez::utils::enum_arithmethic;
+    for (auto i = rankToStartFrom; i <= maxTouchedRank; ++i) {
         auto currRank = NodeRank{i};
         assert(currRank < layers_.info.rsize());
         auto& layer = layers_.info[currRank];
@@ -595,6 +589,6 @@ CalcGraph::Value CalcGraph::getValueAt(CalcGraph::NodeId nodeId) const
     assert(nodeId < nodes_.rsize());
     return nodes_[nodeId].value();
 }
-}
+} //  anodes
 
 #endif // ACTION_NODES_GRAPH_H
