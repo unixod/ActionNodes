@@ -18,7 +18,7 @@ namespace anodes {
 
 
 
-class CalcGraph {
+class Graph {
 public:
     enum class NodeId : std::size_t {};
 
@@ -107,10 +107,10 @@ private:
 } //  anodes
 
 template<>
-struct ez::utils::EnableEnumArithmeticFor<anodes::CalcGraph::NodeRank>{};
+struct ez::utils::EnableEnumArithmeticFor<anodes::Graph::NodeRank>{};
 
 namespace anodes {
-class CalcGraph::Expression {
+class Graph::Expression {
 public:
     Expression() = default;
 
@@ -124,11 +124,11 @@ public:
         using NodeIdSetValType =
             typename std::iterator_traits<decltype(std::begin(nodes))>::value_type;
 
-        static_assert(std::is_same_v<std::decay_t<NodeIdSetValType>, CalcGraph::NodeId>,
+        static_assert(std::is_same_v<std::decay_t<NodeIdSetValType>, Graph::NodeId>,
                 "CalcGraph::Expression must be initialized with a set of CalcGraph::NodeIds");
     }
 
-    Value calc(const CalcGraph& graph) const
+    Value calc(const Graph& graph) const
     {
         std::underlying_type_t<Value> sum{};
 
@@ -149,9 +149,9 @@ private:
     std::vector<NodeId> nodes_;
 };
 
-class CalcGraph::Node {
+class Graph::Node {
 public:
-    Node(const CalcGraph&, NodeId /*thisNodeId*/, Value v) noexcept
+    Node(const Graph&, NodeId /*thisNodeId*/, Value v) noexcept
         : value_{v}
     {}
 
@@ -159,7 +159,7 @@ public:
         typename Expr,
         typename = std::enable_if_t<IsExpression<Expr>::value>
     >
-    Node(CalcGraph& graph, NodeId thisNodeId, Expr&& expr) noexcept
+    Node(Graph& graph, NodeId thisNodeId, Expr&& expr) noexcept
         : expr_{std::forward<Expr>(expr)}
     {
         fetchValueAndRank(graph);
@@ -177,7 +177,7 @@ public:
     /// @a thisNodeId is supposed to be equal to id initialy used
     /// to construct this instance.
     template<typename ValueType>
-    void reset(CalcGraph& graph, NodeId thisNodeId, ValueType&& expr)
+    void reset(Graph& graph, NodeId thisNodeId, ValueType&& expr)
     {
         using DecayedValueType = std::decay_t<ValueType>;
         constexpr bool vtIsExprOrValue = IsExpression<DecayedValueType>::value || IsValue<DecayedValueType>::value;
@@ -218,7 +218,7 @@ public:
     }
 
     /// Actualize value and rank if expr isn't empty.
-    void fetchValueAndRank(const CalcGraph& graph)
+    void fetchValueAndRank(const Graph& graph)
     {
         value_ = expr_.calc(graph);
         rank_ = fetchRank_(graph);
@@ -230,7 +230,7 @@ private:
     /// Rank is calculated by finding max rank of among adjacent
     /// dependency nodes and incrementing it by one, if there are
     /// no dependencies result rank is 0.
-    NodeRank fetchRank_(const CalcGraph& graph) const noexcept
+    NodeRank fetchRank_(const Graph& graph) const noexcept
     {
         NodeRank rank{-1};
 
@@ -258,7 +258,7 @@ public:
 
 
 template<typename ValueType>
-void CalcGraph::resetValueAt(NodeId nodeId, ValueType&& expr, utils::ThreadPool& pool)
+void Graph::resetValueAt(NodeId nodeId, ValueType&& expr, utils::ThreadPool& pool)
 {
     using DecayedValueType = std::decay_t<ValueType>;
     constexpr bool vtIsExprOrValue = IsExpression<DecayedValueType>::value || IsValue<DecayedValueType>::value;
@@ -431,7 +431,7 @@ void CalcGraph::resetValueAt(NodeId nodeId, ValueType&& expr, utils::ThreadPool&
     }
 }
 
-CalcGraph::Value CalcGraph::getValueAt(CalcGraph::NodeId nodeId) const
+Graph::Value Graph::getValueAt(Graph::NodeId nodeId) const
 {
     assert(nodeId < nodes_.rsize());
     return nodes_[nodeId].value();

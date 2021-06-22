@@ -24,7 +24,7 @@ decltype(auto) match(Visitor&& v, Callable&&... func)
 }
 
 using anodes::utils::ThreadPool;
-using anodes::CalcGraph;
+using anodes::Graph;
 
 int main()
 {
@@ -32,15 +32,15 @@ int main()
     namespace utils = anodes::bench_cli::utils;
 
     ThreadPool pool;
-    CalcGraph graph;
+    Graph graph;
 
     using CellId = std::string;
-    std::map<CellId, CalcGraph::NodeId, std::less<>> symbolTable;
+    std::map<CellId, Graph::NodeId, std::less<>> symbolTable;
 
     auto getNode = [&graph, &symbolTable, &pool](auto cellId) {
         auto i = symbolTable.lower_bound(cellId);
         if (i == symbolTable.end() || i->first != cellId) {
-            auto n = graph.addNode(CalcGraph::Value{}, pool);
+            auto n = graph.addNode(Graph::Value{}, pool);
             i = symbolTable.emplace_hint(i, cellId, n);
         }
         return i->second;
@@ -62,14 +62,14 @@ int main()
 
         utils::match(cellExpr,
             [&resetNodeValue, cellId = cellId](parser::Number n) {
-                resetNodeValue(cellId, CalcGraph::Value{n});
+                resetNodeValue(cellId, Graph::Value{n});
             },
             [&getNode, &resetNodeValue, cellId = cellId](const parser::CellsSum& sum) {
-                std::vector<CalcGraph::NodeId> cs;
+                std::vector<Graph::NodeId> cs;
                 for (auto sumMemberCellId : sum) {
                     cs.push_back(getNode(sumMemberCellId));
                 }
-                resetNodeValue(cellId, CalcGraph::Expression{std::move(cs)});
+                resetNodeValue(cellId, Graph::Expression{std::move(cs)});
             }
         );
     }
