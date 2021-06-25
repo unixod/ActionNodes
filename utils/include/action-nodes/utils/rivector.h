@@ -2,6 +2,7 @@
 #define ACTION_NODES_UTILS_RIVECTOR_H
 
 #include <vector>
+#include "ez/support/std23.h"
 
 namespace anodes::utils {
 
@@ -16,6 +17,7 @@ public:
 
     auto& operator[](Idx idx)
     {
+        assert(idx < rsize());
         assert(ez::support::std23::to_underlying(idx) >= 0);
         assert(ez::utils::toUnsigned(ez::support::std23::to_underlying(idx)) < std::numeric_limits<SizeType>::max());
 
@@ -24,6 +26,7 @@ public:
 
     auto& operator[](Idx idx) const
     {
+        assert(idx < rsize());
         assert(ez::support::std23::to_underlying(idx) >= 0);
         assert(ez::utils::toUnsigned(ez::support::std23::to_underlying(idx)) < std::numeric_limits<SizeType>::max());
 

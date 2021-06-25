@@ -6,6 +6,9 @@
 #include <atomic>
 #include <numeric>
 #include <type_traits>
+#include <span>
+#include <optional>
+#include <ranges>
 #include <ez/support/std23.h>
 #include <ez/utils/utils.h>
 #include <ez/utils/enum-arithmetic.h>
@@ -16,48 +19,56 @@
 
 namespace anodes {
 
-
-
 class Graph {
 public:
     enum class NodeId : std::size_t {};
-
-    class Expression;
-    enum class Value : std::int64_t {};
 
 private:
     class Node;
     enum class NodeRank {Nil = -1};
 
-    template<typename T>
-    using IsExpression = std::is_same<std::decay_t<T>, Expression>;
-
-    template<typename T>
-    using IsValue = std::is_same<std::decay_t<T>, Value>;
-
 public:
-    template<typename ValueType>
-    NodeId addNode(ValueType&& expr, utils::ThreadPool& pool)
+    NodeId addNode()
     {
-        using DecayedValueType = std::decay_t<ValueType>;
-        constexpr bool vtIsExprOrValue = IsExpression<DecayedValueType>::value || IsValue<DecayedValueType>::value;
-        static_assert(vtIsExprOrValue, "ValueType must be either CalcGraph::Value or CalcGraph::Expression.");
-
         auto nodeId = NodeId{nodes_.size()};
-        nodes_.emplace_back(*this, nodeId, Value{});
-
-        resetValueAt(nodeId, std::forward<ValueType>(expr), pool);
+        nodes_.emplace_back();
         return nodeId;
     }
 
-    template<typename ValueType>
-    void resetValueAt(NodeId nodeId, ValueType&& value, utils::ThreadPool&);
+    /// Remove all outedges from nodeId and add new ones which point to @a deps.
+    ///
+    /// Formarly speaking, given a graph G and relation R representing the
+    /// interconnetions between nodes within G, this function removes all
+    /// pairs (a, x) from R, where a is a node whose id is @a nodeId, and
+    /// then adds a new set of pairs of form: (a, y) where y is nodes whose ids
+    /// are given in @nodeNewDependencies.
+    template<
+        typename NodeIdsRange,
+        std::invocable<NodeId> UpdateHandler,
+        typename MapReduceEngine
+    >
+    void reorder(NodeId node, NodeIdsRange&& nodeNewDependencies, MapReduceEngine&&, UpdateHandler&& updateHandler);
 
-    Value getValueAt(NodeId) const;
+    template<
+        typename UpdateHandler,
+        typename MapReduceEngine
+    >
+    void touch(NodeId nodeId, MapReduceEngine&&, UpdateHandler&&);
+
+    std::span<const NodeId> getNodeDeps(NodeId) const;
+
+private:
+    template<
+        typename NodeIdsRange,
+        std::invocable<NodeId> UpdateHandler,
+        typename MapReduceEngine
+    >
+    void propagate_(NodeId node, NodeRank rankToStartFrom, NodeRank maxTouchedRank, NodeIdsRange&& nodeNewDependencies, MapReduceEngine&&, UpdateHandler&& updateHandler);
+
 
 private:
     utils::RIVector<Node, NodeId> nodes_;
-    utils::SparseSet<NodeId> stopNodes_;       // Used in resetValueAt for handle possible cycles.
+//    utils::SparseSet<NodeId> stopNodes_;       // Used in resetValueAt for handle possible cycles.
 
 
     struct LayerInfo {
@@ -110,96 +121,32 @@ template<>
 struct ez::utils::EnableEnumArithmeticFor<anodes::Graph::NodeRank>{};
 
 namespace anodes {
-class Graph::Expression {
-public:
-    Expression() = default;
-
-    template<
-        typename NodeIdSet,
-        typename = std::void_t<decltype(std::begin(std::declval<NodeIdSet&>()))>
-    >
-    Expression(const NodeIdSet& nodes)
-        : nodes_(std::begin(nodes), std::end(nodes))
-    {
-        using NodeIdSetValType =
-            typename std::iterator_traits<decltype(std::begin(nodes))>::value_type;
-
-        static_assert(std::is_same_v<std::decay_t<NodeIdSetValType>, Graph::NodeId>,
-                "CalcGraph::Expression must be initialized with a set of CalcGraph::NodeIds");
-    }
-
-    Value calc(const Graph& graph) const
-    {
-        std::underlying_type_t<Value> sum{};
-
-        for (auto& m : nodes_) {
-            sum += ez::support::std23::to_underlying(graph.getValueAt(m));
-        }
-
-        return Value{sum};
-    }
-
-    const std::vector<NodeId>& dependencies() const noexcept
-    {
-        return nodes_;
-    }
-
-private:
-    /// A set of nodes whose values comprise the value of this node.
-    std::vector<NodeId> nodes_;
-};
 
 class Graph::Node {
 public:
-    Node(const Graph&, NodeId /*thisNodeId*/, Value v) noexcept
-        : value_{v}
-    {}
-
-    template<
-        typename Expr,
-        typename = std::enable_if_t<IsExpression<Expr>::value>
-    >
-    Node(Graph& graph, NodeId thisNodeId, Expr&& expr) noexcept
-        : expr_{std::forward<Expr>(expr)}
-    {
-        fetchValueAndRank(graph);
-
-        // Subscribe this node for updates.
-        for (auto nodeId : expr_.dependencies()) {
-            auto& depNode = graph.nodes_[nodeId];
-            depNode.subscribedToUpdate_.push_back(thisNodeId);
-        }
-    }
-
     /// Reset node value and rank.
     ///
     /// @note
     /// @a thisNodeId is supposed to be equal to id initialy used
     /// to construct this instance.
-    template<typename ValueType>
-    void reset(Graph& graph, NodeId thisNodeId, ValueType&& expr)
+    template<typename DepNodesRange>
+    void reset(Graph& graph, NodeId thisNodeId, DepNodesRange&& newDeps)
     {
-        using DecayedValueType = std::decay_t<ValueType>;
-        constexpr bool vtIsExprOrValue = IsExpression<DecayedValueType>::value || IsValue<DecayedValueType>::value;
-        static_assert(vtIsExprOrValue, "ValueType must be either CalcGraph::Value or CalcGraph::Expression.");
-
-        if constexpr (IsExpression<DecayedValueType>::value) {
-            // Unsubscribe this node for updates by current adjacent dependency nodes.
-            for (auto nodeId : expr_.dependencies()) {
-                auto& depNode = graph.nodes_[nodeId];
-                auto i = std::find(depNode.subscribedToUpdate_.cbegin(), depNode.subscribedToUpdate_.cend(), thisNodeId);
-                depNode.subscribedToUpdate_.erase(i);
-            }
+        // Unsubscribe this node for updates by current set of dependency nodes.
+        for (auto nodeId : deps_) {
+            auto& depNode = graph.nodes_[nodeId];
+            auto i = std::ranges::find(depNode.subscribedToUpdate_, thisNodeId);
+            depNode.subscribedToUpdate_.erase(i);
         }
 
-        // Save subscribed node ids.
-        auto tmp = std::move(subscribedToUpdate_);
+        // Subscribe this node for updates by a new set of dependencies.
+        for (auto nodeId : newDeps) {
+            auto& depNode = graph.nodes_[nodeId];
+            depNode.subscribedToUpdate_.push_back(thisNodeId);
+        }
 
-        *this = Node{graph, thisNodeId, std::forward<ValueType>(expr)};
-        assert(subscribedToUpdate_.empty());
-
-        // Restore subscribed node ids.
-        subscribedToUpdate_ = std::move(tmp);
+        rank_ = getNextRank_(graph, newDeps);
+        deps_.assign(std::cbegin(newDeps), std::cend(newDeps));
     }
 
     NodeRank rank() const noexcept
@@ -207,21 +154,19 @@ public:
         return rank_;
     }
 
-    Value value() const noexcept
+    std::span<const NodeId> dependencies() const noexcept
     {
-        return value_;
+        return deps_;
     }
 
-    const std::vector<NodeId>& subscribedNodeIds() const noexcept
+    std::span<const NodeId> subscribedNodeIds() const noexcept
     {
         return subscribedToUpdate_;
     }
 
-    /// Actualize value and rank if expr isn't empty.
-    void fetchValueAndRank(const Graph& graph)
+    void fetchRank(const Graph& graph) noexcept
     {
-        value_ = expr_.calc(graph);
-        rank_ = fetchRank_(graph);
+        rank_ = getNextRank_(graph, deps_);
     }
 
 private:
@@ -230,13 +175,14 @@ private:
     /// Rank is calculated by finding max rank of among adjacent
     /// dependency nodes and incrementing it by one, if there are
     /// no dependencies result rank is 0.
-    NodeRank fetchRank_(const Graph& graph) const noexcept
+    template<typename NodeIdsRange>
+    static NodeRank getNextRank_(const Graph& graph, NodeIdsRange&& nodes) noexcept
     {
-        NodeRank rank{-1};
+        NodeRank rank = NodeRank::Nil;
 
-        for (auto nodeId : expr_.dependencies()) {
+        for (auto nodeId : nodes) {
             auto& depNode = graph.nodes_[nodeId];
-            rank = std::max(rank, depNode.rank_);
+            rank = std::max(rank, depNode.rank());
         }
 
         using namespace ez::utils::enum_arithmethic;
@@ -244,9 +190,8 @@ private:
     }
 
 private:
-    Expression expr_;
+    std::vector<NodeId> deps_;
     NodeRank rank_ = NodeRank::Nil;
-    Value value_;
 
     /// A set of nodes dependent on the value/rank of this node.
     std::vector<NodeId> subscribedToUpdate_;
@@ -256,153 +201,94 @@ public:
     utils::NonAtomicallyMovableAtomicFlag isScheduledForIncrementalUpdate;
 };
 
-
-template<typename ValueType>
-void Graph::resetValueAt(NodeId nodeId, ValueType&& expr, utils::ThreadPool& pool)
+inline std::span<const Graph::NodeId> Graph::getNodeDeps(Graph::NodeId id) const
 {
-    using DecayedValueType = std::decay_t<ValueType>;
-    constexpr bool vtIsExprOrValue = IsExpression<DecayedValueType>::value || IsValue<DecayedValueType>::value;
-    static_assert(vtIsExprOrValue, "ValueType must be either CalcGraph::Value or CalcGraph::Expression.");
+    return nodes_[id].dependencies();
+}
 
+template<
+    typename NodeIdsRange,
+    std::invocable<Graph::NodeId> UpdateHandler,
+    typename MapReduceEngine
+>
+void Graph::propagate_(NodeId nodeId, NodeRank startRank, NodeRank endRank, NodeIdsRange&& depNodes, MapReduceEngine&& pool, UpdateHandler&& updateHandler)
+{
     assert(nodeId < nodes_.rsize());
+    assert(startRank != NodeRank::Nil);
+
+    constexpr auto isReorderingOperaion = !std::is_same_v<std::decay_t<NodeIdsRange>, std::nullopt_t>;
+
+    if constexpr (isReorderingOperaion) {
+        assert(
+            std::ranges::all_of(depNodes, [this](auto n){ return n < nodes_.rsize(); }) && "All nodes from depNodes (if any) must exist."
+        );
+    }
 
     // Add predecessors to layers.
-    auto schedulePredsForProcessing = [this](NodeId id) {
-        auto minTouchedRank = NodeRank::Nil;
+    auto schedulePredsForProcessing = [this, skipNodeId = nodeId](NodeId id) {
+        auto minTouchedRank = static_cast<NodeRank>(layers_.info.size());
         auto maxTouchedRank = NodeRank::Nil;
 
         // Populate layers (schedule processing of predecessors).
         for (auto predNodeId : nodes_[id].subscribedNodeIds()) {
             // Avoid cycles.
-            if (stopNodes_.contains(predNodeId)) {
+            if (predNodeId == skipNodeId) {
                 continue;
             }
 
             assert(predNodeId < nodes_.rsize());
 
-            auto predNodeRank = nodes_[predNodeId].rank();
+            const auto predNodeRank = nodes_[predNodeId].rank();
             assert(predNodeRank != NodeRank::Nil);
 
-            std::tie(minTouchedRank, maxTouchedRank) =
-                    std::minmax({minTouchedRank, maxTouchedRank, predNodeRank});
+            minTouchedRank = std::min(minTouchedRank, predNodeRank);
+            maxTouchedRank = std::min(maxTouchedRank, predNodeRank);
 
             if (auto& predNode = nodes_[predNodeId]; predNode.isScheduledForIncrementalUpdate.testAndSet()) {
                 continue;
             }
 
-            auto offset = layers_.info[predNodeRank].schedSize++;
-            auto layerBaseBuffOffset = layers_.info[predNodeRank].baseBuffOffset;
+            const auto offset = layers_.info[predNodeRank].schedSize++;
+            const auto layerBaseBuffOffset = layers_.info[predNodeRank].baseBuffOffset;
             assert(ez::utils::toUnsigned(layerBaseBuffOffset + offset) < layers_.buff.size());
             layers_.buff[ez::utils::toUnsigned(layerBaseBuffOffset + offset)] = predNodeId;
         }
 
+        assert(minTouchedRank != NodeRank::Nil);
         return std::pair{minTouchedRank, maxTouchedRank};
     };
 
-    auto update = [this, graph=this, &schedulePredsForProcessing](NodeId id) {
+    auto update = [this, graph=this, &schedulePredsForProcessing, &updateHandler](NodeId id) {
         auto& node = nodes_[id];
 
         node.isScheduledForIncrementalUpdate.clear();
 
-        const auto originalRank = node.rank();
-        node.fetchValueAndRank(*graph);
-        const auto newRank = node.rank();
+        if constexpr (isReorderingOperaion) {
+            const auto originalRank = node.rank();
+            node.fetchRank(*graph);
+            updateHandler(id);
+            const auto newRank = node.rank();
 
-        if (newRank != originalRank) {
-            assert(newRank < layers_.info.rsize());
-            layers_.info[originalRank].capacityDeltaUpdate--;
-            layers_.info[newRank].capacityDeltaUpdate++;
+            if (newRank != originalRank) {
+                assert(newRank < layers_.info.rsize());
+                layers_.info[originalRank].capacityDeltaUpdate--;
+                layers_.info[newRank].capacityDeltaUpdate++;
+            }
+
+            auto [mi, ma] = schedulePredsForProcessing(id);
+
+            return std::max({newRank, originalRank, ma});
         }
-
-        schedulePredsForProcessing(id);
-
-        return std::max(newRank, originalRank);
+        else {
+            updateHandler(id);
+            auto [mi, ma] = schedulePredsForProcessing(id);
+            return std::max(node.rank(), ma);
+        }
     };
 
-    stopNodes_.clear();
-    if constexpr (!std::is_same_v<DecayedValueType, Value>) {
-        // Temporarly mark successor nodes to prevent cycling.
-        for (auto id : expr.dependencies()) {
-            stopNodes_.set(id);
-        }
-    }
-
-    auto& node = nodes_[nodeId];
-    const auto originalRank = node.rank();
-    node.reset(*this, nodeId, std::forward<ValueType>(expr));
-    const auto newRank = node.rank();
-
-    // Space in buff is only necessary for nodes with rank > 0.
-    const auto schedulePopBuf = newRank < originalRank;
-
-    auto rankToStartFrom = originalRank;
-    auto maxTouchedRank = newRank;
-
-    if (newRank > originalRank) {
-        // For each node with rank > 0 reserve one element in buf.
-        if (originalRank == NodeRank::Nil) {
-            layers_.buff.push_back({});
-        }
-
-        // Add more layer descriptors if node is moved beyoud the current set of layers.
-        assert(layers_.info.size() <= nodes_.size());
-        using namespace ez::utils::enum_arithmethic;
-        const auto rankDiff = ez::utils::toUnsigned(ez::support::std23::to_underlying(newRank - originalRank));
-        const auto layersCntToAdd = std::min<std::size_t>(rankDiff,  nodes_.size() - layers_.info.size());
-
-        if (layersCntToAdd > 0) {
-            layers_.info.resize(layers_.info.size() + layersCntToAdd, 0);
-        }
-
-        assert(newRank <= layers_.info.rsize());
-        layers_.info[newRank].capacityDeltaUpdate++;
-
-        // Nil rank elements don't have dedicated element in layers_ structure.
-        if (originalRank != NodeRank::Nil) {
-            layers_.info[originalRank].capacityDeltaUpdate--;
-        }
-        else {
-           rankToStartFrom = newRank;
-           assert(!layers_.info.empty() && "There must be at least one layer corresponding to newRank");
-           maxTouchedRank = static_cast<NodeRank>(layers_.info.size() - 1);
-        }
-    }
-    else if (newRank < originalRank){
-        rankToStartFrom = newRank;
-        maxTouchedRank = originalRank;
-
-        layers_.info[originalRank].capacityDeltaUpdate--;
-
-        // Nil rank elements don't have dedicated element in layers_ structure.
-        if (newRank != NodeRank::Nil) {
-            layers_.info[newRank].capacityDeltaUpdate++;
-        }
-        else {
-            assert(!layers_.info.empty() && "There must be at least one layer corresponding to originalRank");
-            maxTouchedRank = static_cast<NodeRank>(layers_.info.size() - 1);
-        }
-    }
-
     auto [mi, ma] = schedulePredsForProcessing(nodeId);
-
-
-    if (rankToStartFrom == NodeRank::Nil) {
-        if (mi == NodeRank::Nil) {
-            // Move rankToStartFrom to a valid range ranks (low boundary) to iterate over layers.
-            rankToStartFrom = NodeRank{0};
-        }
-        else {
-            rankToStartFrom = mi;
-        }
-    }
-    else if (mi == NodeRank::Nil) {
-        rankToStartFrom = NodeRank{0};
-    }
-    else {
-        rankToStartFrom = std::min(rankToStartFrom, mi);
-    }
-
-    maxTouchedRank = std::max(maxTouchedRank, ma);
+    const auto rankToStartFrom = std::min(startRank, mi);
+    auto maxTouchedRank = std::max(endRank, ma);
 
     auto layerBuffBaseDelta = std::ptrdiff_t{0};
     using namespace ez::utils::enum_arithmethic;
@@ -425,17 +311,106 @@ void Graph::resetValueAt(NodeId nodeId, ValueType&& expr, utils::ThreadPool& poo
         layer.capacityDeltaUpdate = 0;
         layer.schedSize = 0;
     }
+}
+
+template<
+    typename NodeIdsRange,
+    std::invocable<Graph::NodeId> UpdateHandler,
+    typename MapReduceEngine
+>
+void Graph::reorder(NodeId nodeId, NodeIdsRange&& depNodes, MapReduceEngine&& pool, UpdateHandler&& updateHandler)
+{
+    auto& node = nodes_[nodeId];
+    const auto originalRank = node.rank();
+    node.reset(*this, nodeId, depNodes);
+    const auto newRank = node.rank();
+
+    // Space in buff is only necessary for nodes with rank > 0.
+    const auto schedulePopBuf = newRank < originalRank;
+
+    auto rankToStartFrom = originalRank;
+    auto maxTouchedRank = newRank;
+
+    if (newRank > originalRank) {
+        // For each node with rank > 0 reserve one element in buf.
+        if (originalRank == NodeRank::Nil) {
+            layers_.buff.push_back({});
+        }
+
+        //==-----------------------------------------------------------------------------==//
+        // Add more layer descriptors if node is moved beyoud the current set of layers.
+        //==-----------------------------------------------------------------------------==//
+        assert(layers_.info.size() <= nodes_.size() && "Number of ranks can't exceed the number of nodes.");
+        using namespace ez::utils::enum_arithmethic;
+
+        const auto maxPossibleNumOrRanks = nodes_.size();
+        const auto maxPossibleNumOfNewRanks = maxPossibleNumOrRanks - layers_.info.size(); // Invariant: Number of ranks can't exceed total number of nodes.
+        const auto maxPossibleNumOfNewRanksDueToThisOperation = ez::utils::toUnsigned(ez::support::std23::to_underlying(newRank - originalRank));
+        const auto layersCntToAdd = std::min<std::size_t>(maxPossibleNumOfNewRanksDueToThisOperation,  maxPossibleNumOfNewRanks);
+
+        if (layersCntToAdd > 0) {
+            layers_.info.resize(layers_.info.size() + layersCntToAdd, 0);
+        }
+
+        assert(layers_.info.size() <= nodes_.size() && "Number of ranks can't exceed the number of nodes.");
+        assert(newRank < layers_.info.rsize());
+
+        layers_.info[newRank].capacityDeltaUpdate++;
+
+        // Nil rank elements don't have dedicated element in layers_ structure.
+        if (originalRank != NodeRank::Nil) {
+            layers_.info[originalRank].capacityDeltaUpdate--;
+        }
+        else {
+            rankToStartFrom = newRank;
+            assert(!layers_.info.empty() && "There must be at least one layer corresponding to newRank");
+            maxTouchedRank = static_cast<NodeRank>(layers_.info.size() - 1);
+        }
+    }
+    else if (newRank < originalRank){
+        layers_.info[originalRank].capacityDeltaUpdate--;
+
+        // Nil rank elements don't have dedicated element in layers_ structure.
+        if (newRank != NodeRank::Nil) {
+            rankToStartFrom = newRank;
+            maxTouchedRank = originalRank;
+            layers_.info[newRank].capacityDeltaUpdate++;
+        }
+        else {
+            assert(!layers_.info.empty() && "There must be at least one layer corresponding to originalRank");
+            assert(rankToStartFrom == originalRank);
+            maxTouchedRank = static_cast<NodeRank>(layers_.info.size() - 1);
+        }
+    }
+    else {
+        assert(newRank == originalRank);
+        rankToStartFrom = static_cast<NodeRank>(layers_.info.size());
+        maxTouchedRank = NodeRank::Nil;
+        assert(rankToStartFrom > maxTouchedRank && "The range must be non-iteratable.");
+    }
+
+    assert(rankToStartFrom != NodeRank::Nil);
+
+    propagate_(nodeId, rankToStartFrom, maxTouchedRank, depNodes, pool, updateHandler);
 
     if (schedulePopBuf) {
         layers_.buff.pop_back();
     }
 }
 
-Graph::Value Graph::getValueAt(Graph::NodeId nodeId) const
+template<
+    typename UpdateHandler,
+    typename MapReduceEngine
+>
+void Graph::touch(NodeId nodeId, MapReduceEngine&& pool, UpdateHandler&& updateHandler)
 {
-    assert(nodeId < nodes_.rsize());
-    return nodes_[nodeId].value();
+    const auto rankToStartFrom = static_cast<NodeRank>(layers_.info.size());
+    const auto maxTouchedRank = NodeRank::Nil;
+    assert(rankToStartFrom > maxTouchedRank && "The range must be non-iteratable.");
+
+    propagate_(nodeId, rankToStartFrom, maxTouchedRank, std::nullopt, pool, updateHandler);
 }
+
 } //  anodes
 
 #endif // ACTION_NODES_GRAPH_H

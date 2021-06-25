@@ -23,8 +23,21 @@ decltype(auto) match(Visitor&& v, Callable&&... func)
 
 }
 
+using Value = std::intptr_t;
+
+
 using anodes::utils::ThreadPool;
 using anodes::Graph;
+
+
+auto cellValSum(const auto& nodes, const auto& nodesVs)
+{
+    auto getNodeVal = [&nodesVs](Graph::NodeId n){
+        return nodesVs[n];
+    };
+
+    return std::transform_reduce(nodes.begin(), nodes.end(), Value{0}, std::plus<>{}, getNodeVal);
+};
 
 int main()
 {
@@ -36,24 +49,67 @@ int main()
 
     using CellId = std::string;
     std::map<CellId, Graph::NodeId, std::less<>> symbolTable;
+    anodes::utils::RIVector<Value, Graph::NodeId> nodesValues;
 
-    auto getNode = [&graph, &symbolTable, &pool](auto cellId) {
+    auto getNode = [&graph, &symbolTable, &nodesValues](auto cellId) {
         auto i = symbolTable.lower_bound(cellId);
         if (i == symbolTable.end() || i->first != cellId) {
-            auto n = graph.addNode(Graph::Value{}, pool);
+            auto n = graph.addNode();
+
+            nodesValues.push_back(0);
+            assert(ez::support::std23::to_underlying(n) == nodesValues.size() - 1 &&
+                   "Each element within nodesValues have a corresponding element in the graph");
+
             i = symbolTable.emplace_hint(i, cellId, n);
         }
         return i->second;
     };
 
-    auto resetNodeValue = [&graph, &symbolTable, &pool](auto cellId, auto&& value){
+    auto resetNodeValue = [&graph, &symbolTable, &pool, &nodesValues](auto cellId, auto&& value){
         auto cellIter = symbolTable.lower_bound(cellId);
         if (cellIter == symbolTable.end() || cellIter->first != cellId) {
-            auto n = graph.addNode(std::forward<decltype(value)>(value), pool);
+            auto n = graph.addNode();
+
+            nodesValues.push_back(value);
+            assert(ez::support::std23::to_underlying(n) == nodesValues.size() - 1 &&
+                   "Each element within nodesValues have a corresponding element in the graph");
+
             symbolTable.emplace_hint(cellIter, cellId, n);
         }
         else {
-            graph.resetValueAt(cellIter->second, std::forward<decltype(value)>(value), pool);
+            nodesValues[cellIter->second] = value;
+
+            graph.touch(cellIter->second, pool, [&nodesValues, &graph](Graph::NodeId nodeId){
+                auto deps = graph.getNodeDeps(nodeId);
+                nodesValues[nodeId] = cellValSum(deps, nodesValues);
+            });
+        }
+    };
+
+
+    auto resetNodeDeps = [&graph, &symbolTable, &pool, &nodesValues](auto cellId, auto&& value){
+        auto cellIter = symbolTable.lower_bound(cellId);
+        if (cellIter == symbolTable.end() || cellIter->first != cellId) {
+            auto n = graph.addNode();
+
+            nodesValues.push_back(cellValSum(value, nodesValues));
+            assert(ez::support::std23::to_underlying(n) == nodesValues.size() - 1 &&
+                   "Each element within nodesValues have a corresponding element in the graph");
+
+
+            graph.reorder(n, std::forward<decltype(value)>(value), pool, [](Graph::NodeId){
+                assert(false && "Unrecheable");
+            });
+
+            symbolTable.emplace_hint(cellIter, cellId, n);
+        }
+        else {
+            nodesValues[cellIter->second] = cellValSum(value, nodesValues);
+
+            graph.reorder(cellIter->second, std::forward<decltype(value)>(value), pool, [&nodesValues, &graph](Graph::NodeId nodeId){
+                auto deps = graph.getNodeDeps(nodeId);
+                nodesValues[nodeId] = cellValSum(deps, nodesValues);
+            });
         }
     };
 
@@ -62,22 +118,21 @@ int main()
 
         utils::match(cellExpr,
             [&resetNodeValue, cellId = cellId](parser::Number n) {
-                resetNodeValue(cellId, Graph::Value{n});
+                resetNodeValue(cellId, Value{n});
             },
-            [&getNode, &resetNodeValue, cellId = cellId](const parser::CellsSum& sum) {
+            [&getNode, &resetNodeDeps, cellId = cellId](const parser::CellsSum& sum) {
                 std::vector<Graph::NodeId> cs;
                 for (auto sumMemberCellId : sum) {
                     cs.push_back(getNode(sumMemberCellId));
                 }
-                resetNodeValue(cellId, Graph::Expression{std::move(cs)});
+                resetNodeDeps(cellId, cs);
             }
         );
     }
 
     for (auto& [cellId, nodeId] : symbolTable) {
-        std::cout << cellId << '=' << ez::support::std23::to_underlying(graph.getValueAt(nodeId)) << '\n';
+        std::cout << cellId << '=' << nodesValues[nodeId] << '\n';
     }
 
     return EXIT_SUCCESS;
 }
-
