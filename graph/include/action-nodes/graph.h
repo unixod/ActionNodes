@@ -23,10 +23,6 @@ class Graph {
 public:
     enum class NodeId : std::size_t {};
 
-private:
-    class Node;
-    enum class NodeRank {Nil = -1};
-
 public:
     NodeId addNode()
     {
@@ -56,6 +52,10 @@ public:
     void touch(NodeId nodeId, MapReduceEngine&&, UpdateHandler&&);
 
     std::span<const NodeId> getNodeDeps(NodeId) const;
+
+private:
+    class Node;
+    enum class NodeRank {Nil = -1};
 
 private:
     template<
