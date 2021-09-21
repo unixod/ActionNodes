@@ -242,7 +242,7 @@ void Graph::propagate_(NodeId nodeId, NodeRank startRank, NodeRank endRank, Node
             assert(predNodeRank != NodeRank::Nil);
 
             minTouchedRank = std::min(minTouchedRank, predNodeRank);
-            maxTouchedRank = std::min(maxTouchedRank, predNodeRank);
+            maxTouchedRank = std::max(maxTouchedRank, predNodeRank);
 
             if (auto& predNode = nodes_[predNodeId]; predNode.isScheduledForIncrementalUpdate.testAndSet()) {
                 continue;
