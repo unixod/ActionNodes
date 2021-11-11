@@ -10,7 +10,7 @@
 #include <optional>
 #include <ranges>
 #include <ez/support/std23.h>
-#include <ez/utils/utils.h>
+#include <ez/utils/type-conversion.h>
 #include <ez/utils/enum-arithmetic.h>
 #include "action-nodes/utils/thread-pool.h"
 #include "action-nodes/utils/rivector.h"
@@ -280,6 +280,7 @@ void Graph::propagate_(NodeId nodeId, NodeRank startRank, NodeRank endRank, Node
             return std::max({newRank, originalRank, ma});
         }
         else {
+            (void)graph;
             updateHandler(id);
             auto [mi, ma] = schedulePredsForProcessing(id);
             return std::max(node.rank(), ma);
